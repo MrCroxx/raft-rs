@@ -9,6 +9,7 @@ on:
 env:
   RUST_BACKTRACE: 1
   RUSTFLAGS: "--deny=warnings"
+  RUST_TOOLCHAIN: nightly-2022-03-09
 
 jobs:
   build_and_test:
@@ -23,9 +24,11 @@ jobs:
             rust: nightly
     steps:
     - uses: actions/checkout@v2
-    - name: setup nightly
-      if: ${{ matrix.rust == 'nightly' }}
-      run: rustup default nightly
+    - name: Install rust toolchain@v1
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: ${{ env.RUST_TOOLCHAIN }}
+        components: rustfmt, clippy
     - name: check format
       if: ${{ matrix.rust == 'stable' && matrix.os == 'ubuntu-latest' }}
       run: cargo fmt --all -- --check
