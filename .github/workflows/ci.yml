@@ -9,6 +9,7 @@ on:
 env:
   RUST_BACKTRACE: 1
   RUSTFLAGS: "--deny=warnings"
+  RUST_TOOLCHAIN: nightly-2022-03-09
 
 jobs:
   build_and_test:
@@ -23,19 +24,19 @@ jobs:
             rust: nightly
     steps:
     - uses: actions/checkout@v2
-    - name: setup nightly
-      if: ${{ matrix.rust == 'nightly' }}
-      run: rustup default nightly
+    - name: Install rust toolchain@v1
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: ${{ env.RUST_TOOLCHAIN }}
+        components: rustfmt, clippy
     - name: check format
       if: ${{ matrix.rust == 'stable' && matrix.os == 'ubuntu-latest' }}
       run: cargo fmt --all -- --check
     - name: check clippy
       if: ${{ matrix.rust == 'stable' && matrix.os == 'ubuntu-latest' }}
-      run: cargo clippy --all --all-targets -- -D clippy::all && cargo clippy --no-default-features --features prost-codec -- -D clippy::all
+      run: cargo clippy --all --all-targets -- -D clippy::all
     - run: cargo test --all -- --nocapture
     # Validate benches still work.
     - run: cargo bench --all -- --test
     # Because failpoints inject failure in code path, which will affect all concurrently running tests, Hence they need to be synchronized, which make tests slow.
     - run: cargo test --tests --features failpoints -- --nocapture
-    # TODO: There is a bug in protobuf-build that cached size is not supported yet, so do not test harness.
-    - run: cargo test --no-default-features --features prost-codec -- --nocapture
