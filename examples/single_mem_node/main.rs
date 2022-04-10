@@ -14,6 +14,7 @@ use slog::{info, o};
 
 type ProposeCallback = Box<dyn Fn() + Send>;
 
+#[allow(clippy::large_enum_variant)]
 enum Msg {
     Propose {
         id: u8,
@@ -21,7 +22,7 @@ enum Msg {
     },
     // Here we don't use Raft Message, so use dead_code to
     // avoid the compiler warning.
-    #[allow(dead_code, clippy::large_enum_variant)]
+    #[allow(dead_code)]
     Raft(Message),
 }
 
