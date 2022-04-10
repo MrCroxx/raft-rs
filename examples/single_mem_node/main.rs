@@ -21,7 +21,7 @@ enum Msg {
     },
     // Here we don't use Raft Message, so use dead_code to
     // avoid the compiler warning.
-    #[allow(dead_code)]
+    #[allow(dead_code, clippy::large_enum_variant)]
     Raft(Message),
 }
 
