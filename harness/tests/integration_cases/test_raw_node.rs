@@ -346,7 +346,7 @@ fn test_raw_node_propose_and_conf_change() {
             }
             context = b"manual".to_vec();
             let mut cc = conf_change_v2(vec![]);
-            cc.context = context.clone().into();
+            cc.context = context.clone();
             raw_node.propose_conf_change(vec![], cc).unwrap();
             rd = raw_node.ready();
         }
@@ -771,7 +771,7 @@ fn test_skip_bcast_commit() {
     let data = cc.encode_to_vec();
     let mut cc_entry = Entry::default();
     cc_entry.set_entry_type(EntryType::EntryConfChange);
-    cc_entry.data = data.into();
+    cc_entry.data = data;
     nt.send(vec![new_message_with_entries(
         1,
         1,

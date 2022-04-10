@@ -357,7 +357,7 @@ fn test_progress_paused() {
     m.set_msg_type(MessageType::MsgPropose);
     let mut e = Entry::default();
     e.data = (b"some_data" as &'static [u8]).into();
-    m.entries = vec![e].into();
+    m.entries = vec![e];
     raft.step(m.clone()).expect("");
     raft.step(m.clone()).expect("");
     raft.step(m).expect("");
@@ -1006,7 +1006,7 @@ fn test_candidate_concede() {
     // send a proposal to 3 to flush out a MsgAppend to 1
     let data = "force follower";
     let mut m = new_message(3, 3, MessageType::MsgPropose, 0);
-    m.entries = vec![new_entry(0, 0, Some(data))].into();
+    m.entries = vec![new_entry(0, 0, Some(data))];
     tt.send(vec![m]);
     // send heartbeat; flush out commit
     tt.send(vec![new_message(3, 3, MessageType::MsgBeat, 0)]);
@@ -1052,7 +1052,7 @@ fn test_old_messages() {
     // pretend we're an old leader trying to make progress; this entry is expected to be ignored.
     let mut m = new_message(2, 1, MessageType::MsgAppend, 0);
     m.term = 2;
-    m.entries = vec![empty_entry(2, 3)].into();
+    m.entries = vec![empty_entry(2, 3)];
     tt.send(vec![m]);
     // commit a new entry
     tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
@@ -1471,7 +1471,7 @@ fn test_raft_frees_read_only_mem() {
     // acknowledge the authority of the leader.
     // more info: raft dissertation 6.4, step 3.
     let mut m = new_message(2, 1, MessageType::MsgHeartbeatResponse, 0);
-    m.context = vec_ctx.clone().into();
+    m.context = vec_ctx.clone();
     sm.step(m).expect("");
     assert_eq!(sm.read_only.read_index_queue.len(), 0);
     assert_eq!(sm.read_only.pending_read_index.len(), 0);
@@ -1503,7 +1503,7 @@ fn test_msg_append_response_wait_reset() {
 
     // A new command is now proposed on node 1.
     m = new_message(1, 0, MessageType::MsgPropose, 0);
-    m.entries = vec![empty_entry(0, 0)].into();
+    m.entries = vec![empty_entry(0, 0)];
     sm.step(m).expect("");
     sm.persist();
 
@@ -3308,7 +3308,7 @@ fn test_commit_after_remove_node() -> Result<()> {
     cc.set_change_type(ConfChangeType::RemoveNode);
     cc.node_id = 2;
     let ccdata = cc.encode_to_vec();
-    entry.data = ccdata.into();
+    entry.data = ccdata;
     msg.entries.push(entry);
     r.step(msg).expect("");
     // Stabilize the log and make sure nothing is committed yet.
@@ -5465,7 +5465,7 @@ fn test_uncommitted_entries_size_limit() {
     let mut nt = Network::new_with_config(vec![None, None, None], config, &l);
     let data = b"hello world!".to_vec();
     let mut entry = Entry::default();
-    entry.data = data.to_vec().into();
+    entry.data = data.to_vec();
     let msg = new_message_with_entries(1, 1, MessageType::MsgPropose, vec![entry]);
 
     nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
@@ -5484,7 +5484,7 @@ fn test_uncommitted_entries_size_limit() {
 
     // after reduce, new proposal should be accepted
     let mut entry = Entry::default();
-    entry.data = data.into();
+    entry.data = data;
     entry.index = 3;
     nt.peers
         .get_mut(&1)
@@ -5522,7 +5522,7 @@ fn test_uncommitted_entry_after_leader_election() {
     let mut nt = Network::new_with_config(vec![None, None, None, None, None], config, &l);
     let data = b"hello world!".to_vec();
     let mut entry = Entry::default();
-    entry.data = data.into();
+    entry.data = data;
     let msg = new_message_with_entries(1, 1, MessageType::MsgPropose, vec![entry]);
 
     nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
@@ -5558,7 +5558,7 @@ fn test_uncommitted_state_advance_ready_from_last_term() {
 
     let data = b"hello world!".to_vec();
     let mut ent = Entry::default();
-    ent.data = data.clone().into();
+    ent.data = data.clone();
 
     nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
 

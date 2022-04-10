@@ -449,8 +449,8 @@ fn test_leader_start_replication() {
         m
     };
     let expect_msgs = vec![
-        new_message_ext(1, 2, wents.clone().into()),
-        new_message_ext(1, 3, wents.clone().into()),
+        new_message_ext(1, 2, wents.clone()),
+        new_message_ext(1, 3, wents.clone()),
     ];
     assert_eq!(msgs, expect_msgs);
     assert_eq!(r.raft_log.unstable_entries(), &*wents);
@@ -618,7 +618,7 @@ fn test_follower_commit_entry() {
         let mut m = new_message(2, 1, MessageType::MsgAppend, 0);
         m.term = 1;
         m.commit = commit;
-        m.entries = ents.clone().into();
+        m.entries = ents.clone();
         r.step(m).expect("");
         r.persist();
 
@@ -754,7 +754,7 @@ fn test_follower_append_entries() {
         m.term = 2;
         m.log_term = term;
         m.index = index;
-        m.entries = ents.into();
+        m.entries = ents;
         r.step(m).expect("");
 
         let g = r.raft_log.all_entries();
@@ -885,7 +885,7 @@ fn test_leader_sync_follower_log() {
         n.send(vec![m]);
 
         let mut m = new_message(1, 1, MessageType::MsgPropose, 0);
-        m.entries = vec![Entry::default()].into();
+        m.entries = vec![Entry::default()];
         n.send(vec![m]);
         let lead_str = ltoa(&n.peers[&1].raft_log);
         let follower_str = ltoa(&n.peers[&2].raft_log);
@@ -914,7 +914,7 @@ fn test_vote_request() {
         m.term = wterm - 1;
         m.log_term = 0;
         m.index = 0;
-        m.entries = ents.clone().into();
+        m.entries = ents.clone();
         r.step(m).expect("");
         r.read_messages();
 

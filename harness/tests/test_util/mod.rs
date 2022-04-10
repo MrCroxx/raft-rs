@@ -143,7 +143,7 @@ pub fn new_message_with_entries(from: u64, to: u64, t: MessageType, ents: Vec<En
         })
     }
     if !ents.is_empty() {
-        m.entries = ents.into();
+        m.entries = ents;
     }
     m
 }
@@ -155,7 +155,7 @@ pub fn new_message(from: u64, to: u64, t: MessageType, n: usize) -> Message {
         for _ in 0..n {
             ents.push(new_entry(0, 0, SOME_DATA));
         }
-        m.entries = ents.into();
+        m.entries = ents;
     }
     m
 }
@@ -165,7 +165,7 @@ pub fn new_entry(term: u64, index: u64, data: Option<&str>) -> Entry {
     e.index = index;
     e.term = term;
     if let Some(d) = data {
-        e.data = d.as_bytes().to_vec().into();
+        e.data = d.as_bytes().to_vec();
     }
     e
 }
