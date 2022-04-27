@@ -4,35 +4,34 @@
 // same time. And reassignment can be optimized by compiler.
 #![allow(clippy::field_reassign_with_default)]
 
-use criterion::{BatchSize, Bencher, BenchmarkId, Criterion, Throughput};
+use criterion::{black_box, Bencher, BenchmarkId, Criterion, Throughput};
 use raft::eraftpb::{ConfState, Entry, Message, Snapshot, SnapshotMetadata};
 use raft::{storage::MemStorage, Config, RawNode};
-use std::time::Duration;
 
-pub fn bench_raw_node(c: &mut Criterion) {
-    bench_raw_node_new(c);
-    bench_raw_node_leader_propose(c);
-    bench_raw_node_new_ready(c);
+use std::time::{Duration, Instant};
+
+pub fn bench_raw_node(c: &mut Criterion, rt: &tokio::runtime::Runtime) {
+    bench_raw_node_new(c, rt);
+    bench_raw_node_leader_propose(c, rt);
+    bench_raw_node_new_ready(c, rt);
 }
 
-fn quick_raw_node(logger: &slog::Logger) -> RawNode<MemStorage> {
+async fn quick_raw_node(logger: &slog::Logger) -> RawNode<MemStorage> {
     let id = 1;
     let conf_state = ConfState::from((vec![1], vec![]));
-    let storage = MemStorage::new_with_conf_state(conf_state);
+    let storage = MemStorage::new_with_conf_state(conf_state).await;
     let config = Config::new(id);
-    RawNode::new(&config, storage, logger).unwrap()
+    RawNode::new(&config, storage, logger).await.unwrap()
 }
 
-pub fn bench_raw_node_new(c: &mut Criterion) {
-    let bench = |b: &mut Bencher| {
-        let logger = raft::default_logger();
-        b.iter(|| quick_raw_node(&logger));
-    };
-
-    c.bench_function("RawNode::new", bench);
+pub fn bench_raw_node_new(c: &mut Criterion, rt: &tokio::runtime::Runtime) {
+    let logger = raft::default_logger();
+    c.bench_with_input(BenchmarkId::new("RawNode::new", ""), &logger, |b, l| {
+        b.to_async(rt).iter(|| async { quick_raw_node(l).await })
+    });
 }
 
-pub fn bench_raw_node_leader_propose(c: &mut Criterion) {
+pub fn bench_raw_node_leader_propose(c: &mut Criterion, rt: &tokio::runtime::Runtime) {
     static KB: usize = 1024;
     let mut test_sets = vec![
         0,
@@ -57,42 +56,50 @@ pub fn bench_raw_node_leader_propose(c: &mut Criterion) {
         } else {
             7
         };
+
         group
             .measurement_time(Duration::from_secs(mtime))
             .throughput(Throughput::Bytes(size as u64))
             .bench_with_input(
-                BenchmarkId::from_parameter(size),
+                BenchmarkId::new("RawNode::propose", size),
                 &size,
                 |b: &mut Bencher, size| {
-                    let logger = raft::default_logger();
-                    let mut node = quick_raw_node(&logger);
-                    node.raft.become_candidate();
-                    node.raft.become_leader();
-                    b.iter_batched(
-                        || (vec![0; 8], vec![0; *size]),
-                        |(context, value)| node.propose(context, value).expect(""),
-                        BatchSize::SmallInput,
-                    );
+                    b.to_async(rt).iter_custom(|iter| async move {
+                        let logger = raft::default_logger();
+                        let mut node = quick_raw_node(&logger).await;
+                        node.raft.become_candidate().await;
+                        node.raft.become_leader().await;
+                        let dataset = vec![(vec![0; 8], vec![0; *size]); iter as usize];
+                        let start = Instant::now();
+                        for (context, value) in dataset {
+                            black_box(node.propose(context, value).await).unwrap();
+                        }
+                        start.elapsed()
+                    });
                 },
             );
     }
 }
 
-pub fn bench_raw_node_new_ready(c: &mut Criterion) {
-    let logger = raft::default_logger();
+pub fn bench_raw_node_new_ready(c: &mut Criterion, rt: &tokio::runtime::Runtime) {
     let mut group = c.benchmark_group("RawNode::ready");
     group
         // TODO: The proper measurement time could be affected by the system and machine.
         .measurement_time(Duration::from_secs(20))
         .bench_function("Default", |b: &mut Bencher| {
-            b.iter_batched(
-                || test_ready_raft_node(&logger),
-                |mut node| {
-                    let _ = node.ready();
-                },
-                // NOTICE: SmallInput accumulates (iters + 10 - 1) / 10 samples per batch
-                BatchSize::SmallInput,
-            );
+            b.to_async(rt).iter_custom(|iters| async move {
+                let logger = raft::default_logger();
+                let mut nodes = Vec::with_capacity(iters as usize);
+                for _ in 0..iters {
+                    let node = test_ready_raft_node(&logger).await;
+                    nodes.push(node);
+                }
+                let start = Instant::now();
+                for mut node in nodes {
+                    black_box(node.ready().await);
+                }
+                start.elapsed()
+            })
         });
 }
 
@@ -103,15 +110,15 @@ pub fn bench_raw_node_new_ready(c: &mut Criterion) {
 //  - A snapshot with 8MB data
 // TODO: Maybe gathering all the things we need into a struct(e.g. something like `ReadyBenchOption`) and use it
 //       to customize the output.
-fn test_ready_raft_node(logger: &slog::Logger) -> RawNode<MemStorage> {
-    let mut node = quick_raw_node(logger);
-    node.raft.become_candidate();
-    node.raft.become_leader();
+async fn test_ready_raft_node(logger: &slog::Logger) -> RawNode<MemStorage> {
+    let mut node = quick_raw_node(logger).await;
+    node.raft.become_candidate().await;
+    node.raft.become_leader().await;
     let unstable = node.raft.raft_log.unstable_entries().to_vec();
     node.raft.raft_log.stable_entries(1, 1);
     node.raft.raft_log.store.wl().append(&unstable).expect("");
-    node.raft.on_persist_entries(1, 1);
-    node.raft.commit_apply(1);
+    node.raft.on_persist_entries(1, 1).await;
+    node.raft.commit_apply(1).await;
     let mut entries = vec![];
     for i in 1..101 {
         let mut e = Entry::default();
@@ -121,12 +128,12 @@ fn test_ready_raft_node(logger: &slog::Logger) -> RawNode<MemStorage> {
         e.term = 1;
         entries.push(e);
     }
-    let _ = node.raft.append_entry(&mut entries);
+    let _ = node.raft.append_entry(&mut entries).await;
     let unstable = node.raft.raft_log.unstable_entries().to_vec();
     node.raft.raft_log.stable_entries(101, 1);
     node.raft.raft_log.store.wl().append(&unstable).expect("");
     // This increases 'committed_index' to `last_index` because there is only one node in quorum.
-    node.raft.on_persist_entries(101, 1);
+    node.raft.on_persist_entries(101, 1).await;
 
     let mut snap = Snapshot::default();
     snap.data = vec![0; 8 * 1024 * 1024];

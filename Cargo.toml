@@ -49,7 +49,7 @@ tokio = { version = "1", features = [
 
 [dev-dependencies]
 anyhow = "1.0.40"
-criterion = "0.3"
+criterion = { version = "0.3", features = ["async", "async_tokio"] }
 datadriven = { path = "datadriven", version = "0.1.0" }
 itertools = "0.10.0"
 regex = "1"
@@ -58,12 +58,9 @@ slog-envlogger = "2.1.0"
 slog-stdlog = "4"
 slog-term = "2.4.0"
 
-# [[bench]]
-# name = "benches"
-# harness = false
-
-# [badges]
-# travis-ci = { repository = "tikv/raft-rs" }
+[[bench]]
+name = "benches"
+harness = false
 
 # [[example]]
 # name = "single_mem_node"
