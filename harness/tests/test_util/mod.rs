@@ -24,10 +24,10 @@ use slog::Logger;
 #[allow(clippy::declare_interior_mutable_const)]
 pub const NOP_STEPPER: Option<Interface> = Some(Interface { raft: None });
 
-pub fn ltoa(raft_log: &RaftLog<MemStorage>) -> String {
+pub async fn ltoa(raft_log: &RaftLog<MemStorage>) -> String {
     let mut s = format!("committed: {}\n", raft_log.committed);
     s = s + &format!("applied: {}\n", raft_log.applied);
-    for (i, e) in raft_log.all_entries().iter().enumerate() {
+    for (i, e) in raft_log.all_entries().await.iter().enumerate() {
         s = s + &format!("#{}: {:?}\n", i, e);
     }
     s
@@ -48,7 +48,7 @@ pub fn new_test_config(id: u64, election_tick: usize, heartbeat_tick: usize) -> 
     }
 }
 
-pub fn new_test_raft(
+pub async fn new_test_raft(
     id: u64,
     peers: Vec<u64>,
     election: usize,
@@ -57,16 +57,16 @@ pub fn new_test_raft(
     l: &Logger,
 ) -> Interface {
     let config = new_test_config(id, election, heartbeat);
-    if storage.initial_state().unwrap().initialized() && peers.is_empty() {
+    if storage.initial_state().await.unwrap().initialized() && peers.is_empty() {
         panic!("new_test_raft with empty peers on initialized store");
     }
-    if !peers.is_empty() && !storage.initial_state().unwrap().initialized() {
-        storage.initialize_with_conf_state((peers, vec![]));
+    if !peers.is_empty() && !storage.initial_state().await.unwrap().initialized() {
+        storage.initialize_with_conf_state((peers, vec![])).await;
     }
-    new_test_raft_with_config(&config, storage, l)
+    new_test_raft_with_config(&config, storage, l).await
 }
 
-pub fn new_test_raft_with_prevote(
+pub async fn new_test_raft_with_prevote(
     id: u64,
     peers: Vec<u64>,
     election: usize,
@@ -77,16 +77,16 @@ pub fn new_test_raft_with_prevote(
 ) -> Interface {
     let mut config = new_test_config(id, election, heartbeat);
     config.pre_vote = pre_vote;
-    if storage.initial_state().unwrap().initialized() && peers.is_empty() {
+    if storage.initial_state().await.unwrap().initialized() && peers.is_empty() {
         panic!("new_test_raft with empty peers on initialized store");
     }
-    if !peers.is_empty() && !storage.initial_state().unwrap().initialized() {
-        storage.initialize_with_conf_state((peers, vec![]));
+    if !peers.is_empty() && !storage.initial_state().await.unwrap().initialized() {
+        storage.initialize_with_conf_state((peers, vec![])).await;
     }
-    new_test_raft_with_config(&config, storage, l)
+    new_test_raft_with_config(&config, storage, l).await
 }
 
-pub fn new_test_raft_with_logs(
+pub async fn new_test_raft_with_logs(
     id: u64,
     peers: Vec<u64>,
     election: usize,
@@ -96,18 +96,22 @@ pub fn new_test_raft_with_logs(
     l: &Logger,
 ) -> Interface {
     let config = new_test_config(id, election, heartbeat);
-    if storage.initial_state().unwrap().initialized() && peers.is_empty() {
+    if storage.initial_state().await.unwrap().initialized() && peers.is_empty() {
         panic!("new_test_raft with empty peers on initialized store");
     }
-    if !peers.is_empty() && !storage.initial_state().unwrap().initialized() {
-        storage.initialize_with_conf_state((peers, vec![]));
+    if !peers.is_empty() && !storage.initial_state().await.unwrap().initialized() {
+        storage.initialize_with_conf_state((peers, vec![])).await;
     }
     storage.wl().append(logs).unwrap();
-    new_test_raft_with_config(&config, storage, l)
+    new_test_raft_with_config(&config, storage, l).await
 }
 
-pub fn new_test_raft_with_config(config: &Config, storage: MemStorage, l: &Logger) -> Interface {
-    Interface::new(Raft::new(config, storage, l).unwrap())
+pub async fn new_test_raft_with_config(
+    config: &Config,
+    storage: MemStorage,
+    l: &Logger,
+) -> Interface {
+    Interface::new(Raft::new(config, storage, l).await.unwrap())
 }
 
 pub fn hard_state(term: u64, commit: u64, vote: u64) -> HardState {

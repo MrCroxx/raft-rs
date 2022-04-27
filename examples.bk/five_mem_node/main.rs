@@ -18,7 +18,8 @@ use regex::Regex;
 
 use slog::{error, info, o};
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let decorator = slog_term::TermDecorator::new().build();
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
     let drain = slog_async::Async::new(drain)
@@ -51,7 +52,7 @@ fn main() {
         let mailboxes = (1..6u64).zip(tx_vec.iter().cloned()).collect();
         let mut node = match i {
             // Peer 1 is the leader.
-            0 => Node::create_raft_leader(1, rx, mailboxes, &logger),
+            0 => Node::create_raft_leader(1, rx, mailboxes, &logger).await,
             // Other peers are followers.
             _ => Node::create_raft_follower(rx, mailboxes),
         };
@@ -64,51 +65,54 @@ fn main() {
         let rx_stop_clone = Arc::clone(&rx_stop);
         let logger = logger.clone();
         // Here we spawn the node on a new thread and keep a handle so we can join on them later.
-        let handle = thread::spawn(move || loop {
-            thread::sleep(Duration::from_millis(10));
+        let handle = tokio::spawn(async move {
             loop {
-                // Step raft messages.
-                match node.my_mailbox.try_recv() {
-                    Ok(msg) => node.step(msg, &logger),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => return,
+                tokio::time::sleep(Duration::from_millis(10));
+                loop {
+                    // Step raft messages.
+                    match node.my_mailbox.try_recv() {
+                        Ok(msg) => node.step(msg, &logger),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => return,
+                    }
                 }
-            }
 
-            let raft_group = match node.raft_group {
-                Some(ref mut r) => r,
-                // When Node::raft_group is `None` it means the node is not initialized.
-                _ => continue,
-            };
+                let raft_group = match node.raft_group {
+                    Some(ref mut r) => r,
+                    // When Node::raft_group is `None` it means the node is not initialized.
+                    _ => continue,
+                };
 
-            if t.elapsed() >= Duration::from_millis(100) {
-                // Tick the raft.
-                raft_group.tick();
-                t = Instant::now();
-            }
-
-            // Let the leader pick pending proposals from the global queue.
-            if raft_group.raft.state == StateRole::Leader {
-                // Handle new proposals.
-                let mut proposals = proposals.lock().unwrap();
-                for p in proposals.iter_mut().skip_while(|p| p.proposed > 0) {
-                    propose(raft_group, p);
+                if t.elapsed() >= Duration::from_millis(100) {
+                    // Tick the raft.
+                    raft_group.tick();
+                    t = Instant::now();
                 }
+
+                // Let the leader pick pending proposals from the global queue.
+                if raft_group.raft.state == StateRole::Leader {
+                    // Handle new proposals.
+                    let mut proposals = proposals.lock().unwrap();
+                    for p in proposals.iter_mut().skip_while(|p| p.proposed > 0) {
+                        propose(raft_group, p).await;
+                    }
+                }
+
+                // Handle readies from the raft.
+                on_ready(
+                    raft_group,
+                    &mut node.kv_pairs,
+                    &node.mailboxes,
+                    &proposals,
+                    &logger,
+                )
+                .await;
+
+                // Check control signals from
+                if check_signals(&rx_stop_clone) {
+                    return;
+                };
             }
-
-            // Handle readies from the raft.
-            on_ready(
-                raft_group,
-                &mut node.kv_pairs,
-                &node.mailboxes,
-                &proposals,
-                &logger,
-            );
-
-            // Check control signals from
-            if check_signals(&rx_stop_clone) {
-                return;
-            };
         });
         handles.push(handle);
     }
@@ -140,7 +144,7 @@ fn main() {
 
     // Wait for the thread to finish
     for th in handles {
-        th.join().unwrap();
+        th.await.unwrap();
     }
 }
 
@@ -168,7 +172,7 @@ struct Node {
 
 impl Node {
     // Create a raft leader only with itself in its configuration.
-    fn create_raft_leader(
+    async fn create_raft_leader(
         id: u64,
         my_mailbox: Receiver<Message>,
         mailboxes: HashMap<u64, Sender<Message>>,
@@ -192,7 +196,7 @@ impl Node {
             .voters = vec![1];
         let storage = MemStorage::new();
         storage.wl().apply_snapshot(s).unwrap();
-        let raft_group = Some(RawNode::new(&cfg, storage, &logger).unwrap());
+        let raft_group = Some(RawNode::new(&cfg, storage, &logger).await.unwrap());
         Node {
             raft_group,
             my_mailbox,
@@ -215,7 +219,7 @@ impl Node {
     }
 
     // Initialize raft for followers.
-    fn initialize_raft_from_message(&mut self, msg: &Message, logger: &slog::Logger) {
+    async fn initialize_raft_from_message(&mut self, msg: &Message, logger: &slog::Logger) {
         if !is_initial_msg(msg) {
             return;
         }
@@ -223,14 +227,14 @@ impl Node {
         cfg.id = msg.to;
         let logger = logger.new(o!("tag" => format!("peer_{}", msg.to)));
         let storage = MemStorage::new();
-        self.raft_group = Some(RawNode::new(&cfg, storage, &logger).unwrap());
+        self.raft_group = Some(RawNode::new(&cfg, storage, &logger).await.unwrap());
     }
 
     // Step a raft message, initialize the raft if need.
     fn step(&mut self, msg: Message, logger: &slog::Logger) {
         if self.raft_group.is_none() {
             if is_initial_msg(&msg) {
-                self.initialize_raft_from_message(&msg, logger);
+                self.initialize_raft_from_message(&msg, logger).await;
             } else {
                 return;
             }
@@ -240,20 +244,55 @@ impl Node {
     }
 }
 
-fn on_ready(
+async fn handle_committed_entries(
+    store: &MemStorage,
+    kv_pairs: &mut HashMap<u16, String>,
+    proposals: &Mutex<VecDeque<Proposal>>,
+    rn: &mut RawNode<MemStorage>,
+    committed_entries: Vec<Entry>,
+) {
+    for entry in committed_entries {
+        if entry.data.is_empty() {
+            // From new elected leaders.
+            continue;
+        }
+        if let EntryType::EntryConfChange = entry.entry_type() {
+            // For conf change messages, make them effective.
+            let cc = ConfChange::decode(&entry.data[..]).unwrap();
+            let cs = rn.apply_conf_change(&cc).await.unwrap();
+            store.wl().set_conf_state(cs);
+        } else {
+            // For normal proposals, extract the key-value pair and then
+            // insert them into the kv engine.
+            let data = str::from_utf8(&entry.data).unwrap();
+            let reg = Regex::new("put ([0-9]+) (.+)").unwrap();
+            if let Some(caps) = reg.captures(data) {
+                kv_pairs.insert(caps[1].parse().unwrap(), caps[2].to_string());
+            }
+        }
+        if rn.raft.state == StateRole::Leader {
+            // The leader should response to the clients, tell them if their proposals
+            // succeeded or not.
+            let proposal = proposals.lock().unwrap().pop_front().unwrap();
+            proposal.propose_success.send(true).unwrap();
+        }
+    }
+}
+
+async fn on_ready(
     raft_group: &mut RawNode<MemStorage>,
     kv_pairs: &mut HashMap<u16, String>,
     mailboxes: &HashMap<u64, Sender<Message>>,
     proposals: &Mutex<VecDeque<Proposal>>,
     logger: &slog::Logger,
 ) {
-    if !raft_group.has_ready() {
+    if !raft_group.has_ready().await {
         return;
     }
     let store = raft_group.raft.raft_log.store.clone();
 
     // Get the `Ready` with `RawNode::ready` interface.
-    let mut ready = raft_group.ready();
+    let mut ready = raft_group.ready().await;
 
     let handle_messages = |msgs: Vec<Message>| {
         for msg in msgs {
@@ -284,37 +323,15 @@ fn on_ready(
         }
     }
 
-    let mut handle_committed_entries =
-        |rn: &mut RawNode<MemStorage>, committed_entries: Vec<Entry>| {
-            for entry in committed_entries {
-                if entry.data.is_empty() {
-                    // From new elected leaders.
-                    continue;
-                }
-                if let EntryType::EntryConfChange = entry.entry_type() {
-                    // For conf change messages, make them effective.
-                    let cc = ConfChange::decode(&entry.data[..]).unwrap();
-                    let cs = rn.apply_conf_change(&cc).unwrap();
-                    store.wl().set_conf_state(cs);
-                } else {
-                    // For normal proposals, extract the key-value pair and then
-                    // insert them into the kv engine.
-                    let data = str::from_utf8(&entry.data).unwrap();
-                    let reg = Regex::new("put ([0-9]+) (.+)").unwrap();
-                    if let Some(caps) = reg.captures(data) {
-                        kv_pairs.insert(caps[1].parse().unwrap(), caps[2].to_string());
-                    }
-                }
-                if rn.raft.state == StateRole::Leader {
-                    // The leader should response to the clients, tell them if their proposals
-                    // succeeded or not.
-                    let proposal = proposals.lock().unwrap().pop_front().unwrap();
-                    proposal.propose_success.send(true).unwrap();
-                }
-            }
-        };
     // Apply all committed entries.
-    handle_committed_entries(raft_group, ready.take_committed_entries());
+    handle_committed_entries(
+        &store,
+        kv_pairs,
+        proposals,
+        raft_group,
+        ready.take_committed_entries(),
+    )
+    .await;
 
     // Persistent raft logs. It's necessary because in `RawNode::advance` we stabilize
     // raft logs to the latest position.
@@ -337,7 +354,7 @@ fn on_ready(
     }
 
     // Call `RawNode::advance` interface to update position flags in the raft.
-    let mut light_rd = raft_group.advance(ready);
+    let mut light_rd = raft_group.advance(ready).await;
     // Update commit index.
     if let Some(commit) = light_rd.commit_index() {
         store.wl().mut_hard_state().commit = commit;
@@ -345,9 +362,16 @@ fn on_ready(
     // Send out the messages.
     handle_messages(light_rd.take_messages());
     // Apply all committed entries.
-    handle_committed_entries(raft_group, light_rd.take_committed_entries());
+    handle_committed_entries(
+        &store,
+        kv_pairs,
+        proposals,
+        raft_group,
+        light_rd.take_committed_entries(),
+    )
+    .await;
     // Advance the apply index.
-    raft_group.advance_apply();
+    raft_group.advance_apply().await;
 }
 
 fn example_config() -> Config {
@@ -401,8 +425,8 @@ impl Proposal {
     }
 }
 
-fn propose(raft_group: &mut RawNode<MemStorage>, proposal: &mut Proposal) {
-    let last_index1 = raft_group.raft.raft_log.last_index() + 1;
+async fn propose(raft_group: &mut RawNode<MemStorage>, proposal: &mut Proposal) {
+    let last_index1 = raft_group.raft.raft_log.last_index().await + 1;
     if let Some((ref key, ref value)) = proposal.normal {
         let data = format!("put {} {}", key, value).into_bytes();
         let _ = raft_group.propose(vec![], data);
@@ -413,7 +437,7 @@ fn propose(raft_group: &mut RawNode<MemStorage>, proposal: &mut Proposal) {
         unimplemented!();
     }
 
-    let last_index2 = raft_group.raft.raft_log.last_index() + 1;
+    let last_index2 = raft_group.raft.raft_log.last_index().await + 1;
     if last_index2 == last_index1 {
         // Propose failed, don't forget to respond to the client.
         proposal.propose_success.send(false).unwrap();

@@ -22,27 +22,30 @@ You can use [`RawNode::new`] to create the Raft node. To create the Raft node, y
 provide a [`Storage`] component, and a [`Config`] to the [`RawNode::new`] function.
 
 ```rust
-use raft::{
-    Config,
-    storage::MemStorage,
-    raw_node::RawNode,
-};
-use slog::{Drain, o};
+# #[tokio::main]
+# async fn main() {
+    use raft::{
+        Config,
+        storage::MemStorage,
+        raw_node::RawNode,
+    };
+    use slog::{Drain, o};
 
-// Select some defaults, then change what we need.
-let config = Config {
-    id: 1,
-    ..Default::default()
-};
-// Initialize logger.
-let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
-// ... Make any configuration changes.
-// After, make sure it's valid!
-config.validate().unwrap();
-// We'll use the built-in `MemStorage`, but you will likely want your own.
-// Finally, create our Raft node!
-let storage = MemStorage::new_with_conf_state((vec![1], vec![]));
-let mut node = RawNode::new(&config, storage, &logger).unwrap();
+    // Select some defaults, then change what we need.
+    let config = Config {
+        id: 1,
+        ..Default::default()
+    };
+    // Initialize logger.
+    let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+    // ... Make any configuration changes.
+    // After, make sure it's valid!
+    config.validate().unwrap();
+    // We'll use the built-in `MemStorage`, but you will likely want your own.
+    // Finally, create our Raft node!
+    let storage = MemStorage::new_with_conf_state((vec![1], vec![])).await;
+    let mut node = RawNode::new(&config, storage, &logger).await.unwrap();
+# }
 ```
 
 ## Ticking the Raft node
@@ -52,45 +55,48 @@ channel `recv_timeout` to drive the Raft node at least every 100ms, calling
 [`tick()`](RawNode::tick) each time.
 
 ```rust
-# use slog::{Drain, o};
-# use raft::{Config, storage::MemStorage, raw_node::RawNode};
-# let config = Config { id: 1, ..Default::default() };
-# let store = MemStorage::new_with_conf_state((vec![1], vec![]));
-# let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
-# let mut node = RawNode::new(&config, store, &logger).unwrap();
-# node.raft.become_candidate();
-# node.raft.become_leader();
-use std::{sync::mpsc::{channel, RecvTimeoutError}, time::{Instant, Duration}};
+# #[tokio::main]
+# async fn main() {
+    # use slog::{Drain, o};
+    # use raft::{Config, storage::MemStorage, raw_node::RawNode};
+    # let config = Config { id: 1, ..Default::default() };
+    # let store = MemStorage::new_with_conf_state((vec![1], vec![])).await;
+    # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+    # let mut node = RawNode::new(&config, store, &logger).await.unwrap();
+    # node.raft.become_candidate().await;
+    # node.raft.become_leader().await;
+    use std::{sync::mpsc::{channel, RecvTimeoutError}, time::{Instant, Duration}};
 
-// We're using a channel, but this could be any stream of events.
-let (tx, rx) = channel();
-let timeout = Duration::from_millis(100);
-let mut remaining_timeout = timeout;
+    // We're using a channel, but this could be any stream of events.
+    let (tx, rx) = channel();
+    let timeout = Duration::from_millis(100);
+    let mut remaining_timeout = timeout;
 
-// Send the `tx` somewhere else...
+    // Send the `tx` somewhere else...
 
-loop {
-    let now = Instant::now();
+    loop {
+        let now = Instant::now();
 
-    match rx.recv_timeout(remaining_timeout) {
-        Ok(()) => {
-            // Let's save this for later.
-            unimplemented!()
-        },
-        Err(RecvTimeoutError::Timeout) => (),
-        Err(RecvTimeoutError::Disconnected) => unimplemented!(),
+        match rx.recv_timeout(remaining_timeout) {
+            Ok(()) => {
+                // Let's save this for later.
+                unimplemented!()
+            },
+            Err(RecvTimeoutError::Timeout) => (),
+            Err(RecvTimeoutError::Disconnected) => unimplemented!(),
+        }
+
+        let elapsed = now.elapsed();
+        if elapsed >= remaining_timeout {
+            remaining_timeout = timeout;
+            // We drive Raft every 100ms.
+            node.tick().await;
+        } else {
+            remaining_timeout -= elapsed;
+        }
+    #    break;
     }
-
-    let elapsed = now.elapsed();
-    if elapsed >= remaining_timeout {
-        remaining_timeout = timeout;
-        // We drive Raft every 100ms.
-        node.tick();
-    } else {
-        remaining_timeout -= elapsed;
-    }
-#    break;
-}
+# }
 ```
 
 ## Proposing to, and stepping the Raft node
@@ -113,60 +119,63 @@ You can call the `step` function when you receive the Raft messages from other n
 Here is a simple example to use `propose` and `step`:
 
 ```rust
-# use raft::{Config, storage::MemStorage, raw_node::RawNode, eraftpb::Message};
-# use std::{
-#     sync::mpsc::{channel, RecvTimeoutError},
-#     time::{Instant, Duration},
-#     collections::HashMap
-# };
-# use slog::{Drain, o};
-#
-# let config = Config { id: 1, ..Default::default() };
-# let store = MemStorage::new_with_conf_state((vec![1], vec![]));
-# let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
-# let mut node = RawNode::new(&config, store, &logger).unwrap();
-# node.raft.become_candidate();
-# node.raft.become_leader();
-#
-# let (tx, rx) = channel();
-# let timeout = Duration::from_millis(100);
-# let mut remaining_timeout = timeout;
-#
-enum Msg {
-    Propose {
-        id: u8,
-        callback: Box<dyn Fn() + Send>,
-    },
-    Raft(Message),
-}
+# #[tokio::main]
+# async fn main() {
+    # use raft::{Config, storage::MemStorage, raw_node::RawNode, eraftpb::Message};
+    # use std::{
+    #     sync::mpsc::{channel, RecvTimeoutError},
+    #     time::{Instant, Duration},
+    #     collections::HashMap
+    # };
+    # use slog::{Drain, o};
+    #
+    # let config = Config { id: 1, ..Default::default() };
+    # let store = MemStorage::new_with_conf_state((vec![1], vec![])).await;
+    # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+    # let mut node = RawNode::new(&config, store, &logger).await.unwrap();
+    # node.raft.become_candidate().await;
+    # node.raft.become_leader().await;
+    #
+    # let (tx, rx) = channel();
+    # let timeout = Duration::from_millis(100);
+    # let mut remaining_timeout = timeout;
+    #
+    enum Msg {
+        Propose {
+            id: u8,
+            callback: Box<dyn Fn() + Send>,
+        },
+        Raft(Message),
+    }
 
-// Simulate a message coming down the stream.
-tx.send(Msg::Propose { id: 1, callback: Box::new(|| ()) });
+    // Simulate a message coming down the stream.
+    tx.send(Msg::Propose { id: 1, callback: Box::new(|| ()) });
 
-let mut cbs = HashMap::new();
-loop {
-    let now = Instant::now();
+    let mut cbs = HashMap::new();
+    loop {
+        let now = Instant::now();
 
-    match rx.recv_timeout(remaining_timeout) {
-        Ok(Msg::Propose { id, callback }) => {
-            cbs.insert(id, callback);
-            node.propose(vec![], vec![id]).unwrap();
+        match rx.recv_timeout(remaining_timeout) {
+            Ok(Msg::Propose { id, callback }) => {
+                cbs.insert(id, callback);
+                node.propose(vec![], vec![id]).await.unwrap();
+            }
+            Ok(Msg::Raft(m)) => node.step(m).await.unwrap(),
+            Err(RecvTimeoutError::Timeout) => (),
+            Err(RecvTimeoutError::Disconnected) => unimplemented!(),
         }
-        Ok(Msg::Raft(m)) => node.step(m).unwrap(),
-        Err(RecvTimeoutError::Timeout) => (),
-        Err(RecvTimeoutError::Disconnected) => unimplemented!(),
-    }
 
-    let elapsed = now.elapsed();
-    if elapsed >= remaining_timeout {
-        remaining_timeout = timeout;
-        // We drive Raft every 100ms.
-        node.tick();
-    } else {
-        remaining_timeout -= elapsed;
+        let elapsed = now.elapsed();
+        if elapsed >= remaining_timeout {
+            remaining_timeout = timeout;
+            // We drive Raft every 100ms.
+            node.tick().await;
+        } else {
+            remaining_timeout -= elapsed;
+        }
+        break;
     }
-    break;
-}
+# }
 ```
 
 In the above example, we use a channel to receive the `propose` and `step` messages. We only
@@ -180,21 +189,24 @@ When your Raft node is ticked and running, Raft should enter a `Ready` state. Yo
 state:
 
 ```rust
-# use slog::{Drain, o};
-# use raft::{Config, storage::MemStorage, raw_node::RawNode};
-#
-# let config = Config { id: 1, ..Default::default() };
-# config.validate().unwrap();
-# let store = MemStorage::new_with_conf_state((vec![1], vec![]));
-# let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
-# let mut node = RawNode::new(&config, store, &logger).unwrap();
-#
-if !node.has_ready() {
-    return;
-}
+# #[tokio::main]
+# async fn main() {
+    # use slog::{Drain, o};
+    # use raft::{Config, storage::MemStorage, raw_node::RawNode};
+    #
+    # let config = Config { id: 1, ..Default::default() };
+    # config.validate().unwrap();
+    # let store = MemStorage::new_with_conf_state((vec![1], vec![])).await;
+    # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+    # let mut node = RawNode::new(&config, store, &logger).await.unwrap();
+    #
+    if !node.has_ready().await {
+        return;
+    }
 
-// The Raft is ready, we can do something now.
-let mut ready = node.ready();
+    // The Raft is ready, we can do something now.
+    let mut ready = node.ready().await;
+# }
 ```
 
 The `Ready` state contains quite a bit of information, and you need to check and process them one
@@ -204,53 +216,58 @@ by one:
 other nodes:
 
     ```rust
-    # use slog::{Drain, o};
-    # use raft::{Config, storage::MemStorage, raw_node::RawNode, StateRole};
-    #
-    # let config = Config { id: 1, ..Default::default() };
-    # config.validate().unwrap();
-    # let store = MemStorage::new_with_conf_state((vec![1], vec![]));
-    # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
-    # let mut node = RawNode::new(&config, store, &logger).unwrap();
-    #
-    # if !node.has_ready() {
-    #   return;
-    # }
-    # let mut ready = node.ready();
-    #
-    if !ready.messages().is_empty() {
-        for msg in ready.take_messages() {
-            // Send messages to other peers.
+    # #[tokio::main]
+    # async fn main() {
+        # use slog::{Drain, o};
+        # use raft::{Config, storage::MemStorage, raw_node::RawNode, StateRole};
+        #
+        # let config = Config { id: 1, ..Default::default() };
+        # config.validate().unwrap();
+        # let store = MemStorage::new_with_conf_state((vec![1], vec![])).await;
+        # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+        # let mut node = RawNode::new(&config, store, &logger).await.unwrap();
+        #
+        # if !node.has_ready().await {
+        #   return;
+        # }
+        # let mut ready = node.ready().await;
+        #
+        if !ready.messages().is_empty() {
+            for msg in ready.take_messages() {
+                // Send messages to other peers.
+            }
         }
-    }
+    # }
     ```
 
 2. Check whether `snapshot` is empty or not. If not empty, it means that the Raft node has received
 a Raft snapshot from the leader and we must apply the snapshot:
 
     ```rust
-    # use slog::{Drain, o};
-    # use raft::{Config, storage::MemStorage, raw_node::RawNode};
-    #
-    # let config = Config { id: 1, ..Default::default() };
-    # config.validate().unwrap();
-    # let store = MemStorage::new_with_conf_state((vec![1], vec![]));
-    # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
-    # let mut node = RawNode::new(&config, store, &logger).unwrap();
-    #
-    # if !node.has_ready() {
-    #   return;
+    # #[tokio::main]
+    # async fn main() {
+        # use slog::{Drain, o};
+        # use raft::{Config, storage::MemStorage, raw_node::RawNode};
+        #
+        # let config = Config { id: 1, ..Default::default() };
+        # config.validate().unwrap();
+        # let store = MemStorage::new_with_conf_state((vec![1], vec![])).await;
+        # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+        # let mut node = RawNode::new(&config, store, &logger).await.unwrap();
+        #
+        # if !node.has_ready().await {
+        #   return;
+        # }
+        # let mut ready = node.ready().await;
+        #
+        if !ready.snapshot().is_empty() {
+            // This is a snapshot, we need to apply the snapshot at first.
+            node.mut_store()
+                .wl()
+                .apply_snapshot(ready.snapshot().clone())
+                .unwrap();
+        }
     # }
-    # let mut ready = node.ready();
-    #
-    if !ready.snapshot().is_empty() {
-        // This is a snapshot, we need to apply the snapshot at first.
-        node.mut_store()
-            .wl()
-            .apply_snapshot(ready.snapshot().clone())
-            .unwrap();
-    }
-
     ```
 
 3. Check whether `committed_entires` is empty or not. If not, it means that there are some newly
@@ -258,47 +275,50 @@ committed log entries which you must apply to the state machine. Of course, afte
 need to update the applied index and resume `apply` later:
 
     ```rust
-    # use slog::{Drain, o};
-    # use raft::{Config, storage::MemStorage, raw_node::RawNode, eraftpb::EntryType};
-    #
-    # let config = Config { id: 1, ..Default::default() };
-    # config.validate().unwrap();
-    # let store = MemStorage::new_with_conf_state((vec![1], vec![]));
-    # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
-    # let mut node = RawNode::new(&config, store, &logger).unwrap();
-    #
-    # if !node.has_ready() {
-    #   return;
-    # }
-    # let mut ready = node.ready();
-    #
-    # fn handle_conf_change(e:  raft::eraftpb::Entry) {
-    # }
-    #
-    # fn handle_conf_change_v2(e:  raft::eraftpb::Entry) {
-    # }
-    #
-    # fn handle_normal(e:  raft::eraftpb::Entry) {
-    # }
-    #
-    let mut _last_apply_index = 0;
-    for entry in ready.take_committed_entries() {
-        // Mostly, you need to save the last apply index to resume applying
-        // after restart. Here we just ignore this because we use a Memory storage.
-        _last_apply_index = entry.index;
+    # #[tokio::main]
+    # async fn main() {
+        # use slog::{Drain, o};
+        # use raft::{Config, storage::MemStorage, raw_node::RawNode, eraftpb::EntryType};
+        #
+        # let config = Config { id: 1, ..Default::default() };
+        # config.validate().unwrap();
+        # let store = MemStorage::new_with_conf_state((vec![1], vec![])).await;
+        # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+        # let mut node = RawNode::new(&config, store, &logger).await.unwrap();
+        #
+        # if !node.has_ready().await {
+        #   return;
+        # }
+        # let mut ready = node.ready().await;
+        #
+        # fn handle_conf_change(e:  raft::eraftpb::Entry) {
+        # }
+        #
+        # fn handle_conf_change_v2(e:  raft::eraftpb::Entry) {
+        # }
+        #
+        # fn handle_normal(e:  raft::eraftpb::Entry) {
+        # }
+        #
+        let mut _last_apply_index = 0;
+        for entry in ready.take_committed_entries() {
+            // Mostly, you need to save the last apply index to resume applying
+            // after restart. Here we just ignore this because we use a Memory storage.
+            _last_apply_index = entry.index;
 
-        if entry.data.is_empty() {
-            // Emtpy entry, when the peer becomes Leader it will send an empty entry.
-            continue;
-        }
+            if entry.data.is_empty() {
+                // Emtpy entry, when the peer becomes Leader it will send an empty entry.
+                continue;
+            }
 
-        match entry.entry_type() {
-            EntryType::EntryNormal => handle_normal(entry),
-            // It's recommended to always use `EntryType::EntryConfChangeV2.
-            EntryType::EntryConfChange => handle_conf_change(entry),
-            EntryType::EntryConfChangeV2 => handle_conf_change_v2(entry),
+            match entry.entry_type() {
+                EntryType::EntryNormal => handle_normal(entry),
+                // It's recommended to always use `EntryType::EntryConfChangeV2.
+                EntryType::EntryConfChange => handle_conf_change(entry),
+                EntryType::EntryConfChangeV2 => handle_conf_change_v2(entry),
+            }
         }
-    }
+    # }
     ```
 
     Note, although Raft guarentees only persisted committed entries will be applied,
@@ -313,25 +333,27 @@ need to update the applied index and resume `apply` later:
 entries but have not been committed yet, we must append the entries to the Raft log:
 
     ```rust
-    # use slog::{Drain, o};
-    # use raft::{Config, storage::MemStorage, raw_node::RawNode};
-    #
-    # let config = Config { id: 1, ..Default::default() };
-    # config.validate().unwrap();
-    # let store = MemStorage::new_with_conf_state((vec![1], vec![]));
-    # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
-    # let mut node = RawNode::new(&config, store, &logger).unwrap();
-    #
-    # if !node.has_ready() {
-    #   return;
+    # #[tokio::main]
+    # async fn main() {
+        # use slog::{Drain, o};
+        # use raft::{Config, storage::MemStorage, raw_node::RawNode};
+        #
+        # let config = Config { id: 1, ..Default::default() };
+        # config.validate().unwrap();
+        # let store = MemStorage::new_with_conf_state((vec![1], vec![])).await;
+        # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+        # let mut node = RawNode::new(&config, store, &logger).await.unwrap();
+        #
+        # if !node.has_ready().await {
+        #   return;
+        # }
+        # let mut ready = node.ready().await;
+        #
+        if !ready.entries().is_empty() {
+            // Append entries to the Raft log
+            node.mut_store().wl().append(ready.entries()).unwrap();
+        }
     # }
-    # let mut ready = node.ready();
-    #
-    if !ready.entries().is_empty() {
-        // Append entries to the Raft log
-        node.mut_store().wl().append(ready.entries()).unwrap();
-    }
-
     ```
 
 5. Check whether `hs` is empty or not. If not empty, it means that the `HardState` of the node has
@@ -339,49 +361,55 @@ changed. For example, the node may vote for a new leader, or the commit index ha
 We must persist the changed `HardState`:
 
     ```rust
-    # use slog::{Drain, o};
-    # use raft::{Config, storage::MemStorage, raw_node::RawNode};
-    #
-    # let config = Config { id: 1, ..Default::default() };
-    # config.validate().unwrap();
-    # let store = MemStorage::new_with_conf_state((vec![1], vec![]));
-    # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
-    # let mut node = RawNode::new(&config, store, &logger).unwrap();
-    #
-    # if !node.has_ready() {
-    #   return;
+    # #[tokio::main]
+    # async fn main() {
+        # use slog::{Drain, o};
+        # use raft::{Config, storage::MemStorage, raw_node::RawNode};
+        #
+        # let config = Config { id: 1, ..Default::default() };
+        # config.validate().unwrap();
+        # let store = MemStorage::new_with_conf_state((vec![1], vec![])).await;
+        # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+        # let mut node = RawNode::new(&config, store, &logger).await.unwrap();
+        #
+        # if !node.has_ready().await {
+        #   return;
+        # }
+        # let mut ready = node.ready().await;
+        #
+        if let Some(hs) = ready.hs() {
+            // Raft HardState changed, and we need to persist it.
+            node.mut_store().wl().set_hardstate(hs.clone());
+        }
     # }
-    # let mut ready = node.ready();
-    #
-    if let Some(hs) = ready.hs() {
-        // Raft HardState changed, and we need to persist it.
-        node.mut_store().wl().set_hardstate(hs.clone());
-    }
     ```
 
 6. Check whether `persisted_messages` is empty or not. If not, it means that the node will send messages to
 other nodes after persisting hardstate, entries and snapshot:
 
     ```rust
-    # use slog::{Drain, o};
-    # use raft::{Config, storage::MemStorage, raw_node::RawNode, StateRole};
-    #
-    # let config = Config { id: 1, ..Default::default() };
-    # config.validate().unwrap();
-    # let store = MemStorage::new_with_conf_state((vec![1], vec![]));
-    # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
-    # let mut node = RawNode::new(&config, store, &logger).unwrap();
-    #
-    # if !node.has_ready() {
-    #   return;
-    # }
-    # let mut ready = node.ready();
-    #
-    if !ready.persisted_messages().is_empty() {
-        for msg in ready.take_persisted_messages() {
-            // Send persisted messages to other peers.
+    # #[tokio::main]
+    # async fn main() {
+        # use slog::{Drain, o};
+        # use raft::{Config, storage::MemStorage, raw_node::RawNode, StateRole};
+        #
+        # let config = Config { id: 1, ..Default::default() };
+        # config.validate().unwrap();
+        # let store = MemStorage::new_with_conf_state((vec![1], vec![])).await;
+        # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+        # let mut node = RawNode::new(&config, store, &logger).await.unwrap();
+        #
+        # if !node.has_ready().await {
+        #   return;
+        # }
+        # let mut ready = node.ready().await;
+        #
+        if !ready.persisted_messages().is_empty() {
+            for msg in ready.take_persisted_messages() {
+                // Send persisted messages to other peers.
+            }
         }
-    }
+    # }
     ```
 
 7. Call `advance` to notify that the previous work is completed. Get the return value `LightReady`
@@ -389,31 +417,34 @@ and handle its `messages` and `committed_entries` like step 1 and step 3 does. T
 to advance the applied index inside.
 
     ```rust
-    # use slog::{Drain, o};
-    # use raft::{Config, storage::MemStorage, raw_node::RawNode};
-    # use raft::eraftpb::{EntryType, Entry, Message};
-    #
-    # let config = Config { id: 1, ..Default::default() };
-    # config.validate().unwrap();
-    # let store = MemStorage::new_with_conf_state((vec![1], vec![]));
-    # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
-    # let mut node = RawNode::new(&config, store, &logger).unwrap();
-    #
-    # if !node.has_ready() {
-    #   return;
+    # #[tokio::main]
+    # async fn main() {
+        # use slog::{Drain, o};
+        # use raft::{Config, storage::MemStorage, raw_node::RawNode};
+        # use raft::eraftpb::{EntryType, Entry, Message};
+        #
+        # let config = Config { id: 1, ..Default::default() };
+        # config.validate().unwrap();
+        # let store = MemStorage::new_with_conf_state((vec![1], vec![])).await;
+        # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+        # let mut node = RawNode::new(&config, store, &logger).await.unwrap();
+        #
+        # if !node.has_ready().await {
+        #   return;
+        # }
+        # let mut ready = node.ready().await;
+        #
+        # fn handle_messages(msgs: Vec<Message>) {
+        # }
+        #
+        # fn handle_committed_entries(committed_entries: Vec<Entry>) {
+        # }
+        let mut light_rd = node.advance(ready).await;
+        // Like step 1 and 3, you can use functions to make them behave the same.
+        handle_messages(light_rd.take_messages());
+        handle_committed_entries(light_rd.take_committed_entries());
+        node.advance_apply().await;
     # }
-    # let mut ready = node.ready();
-    #
-    # fn handle_messages(msgs: Vec<Message>) {
-    # }
-    #
-    # fn handle_committed_entries(committed_entries: Vec<Entry>) {
-    # }
-    let mut light_rd = node.advance(ready);
-    // Like step 1 and 3, you can use functions to make them behave the same.
-    handle_messages(light_rd.take_messages());
-    handle_committed_entries(light_rd.take_committed_entries());
-    node.advance_apply();
     ```
 
 For more information, check out an [example](examples/single_mem_node/main.rs#L113-L179).
@@ -447,23 +478,26 @@ the following:
 
 For example to promote a learner 4 and demote an existing voter 3:
 ```no_run
-# use raft::{Config, storage::MemStorage, raw_node::RawNode, eraftpb::*};
-# use protobuf::Message as PbMessage;
-# use slog::{Drain, o};
-#
-# let mut config = Config { id: 1, ..Default::default() };
-# let store = MemStorage::new_with_conf_state((vec![1, 2], vec![]));
-# let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
-# let mut node = RawNode::new(&mut config, store, &logger).unwrap();
-let steps = vec![
-    raft_proto::new_conf_change_single(4, ConfChangeType::AddNode),
-    raft_proto::new_conf_change_single(3, ConfChangeType::RemoveNode),
-];
-let mut cc = ConfChangeV2::default();
-cc.changes = steps;
-node.propose_conf_change(vec![], cc).unwrap();
-// After the log is committed and applied
-// node.apply_conf_change(&cc).unwrap();
+# #[tokio::main]
+# async fn main() {
+    # use raft::{Config, storage::MemStorage, raw_node::RawNode, eraftpb::*};
+    # use protobuf::Message as PbMessage;
+    # use slog::{Drain, o};
+    #
+    # let mut config = Config { id: 1, ..Default::default() };
+    # let store = MemStorage::new_with_conf_state((vec![1, 2], vec![])).await;
+    # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+    # let mut node = RawNode::new(&mut config, store, &logger).await.unwrap();
+    let steps = vec![
+        raft_proto::new_conf_change_single(4, ConfChangeType::AddNode),
+        raft_proto::new_conf_change_single(3, ConfChangeType::RemoveNode),
+    ];
+    let mut cc = ConfChangeV2::default();
+    cc.changes = steps;
+    node.propose_conf_change(vec![], cc).await.unwrap();
+    // After the log is committed and applied
+    // node.apply_conf_change(&cc).await.unwrap();
+# }
 ```
 
 This process is a two-phase process, during the midst of it the peer group's leader is managing

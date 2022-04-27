@@ -299,9 +299,9 @@ pub struct RawNode<T: Storage> {
 impl<T: Storage> RawNode<T> {
     #[allow(clippy::new_ret_no_self)]
     /// Create a new RawNode given some [`Config`].
-    pub fn new(config: &Config, store: T, logger: &Logger) -> Result<Self> {
+    pub async fn new(config: &Config, store: T, logger: &Logger) -> Result<Self> {
         assert_ne!(config.id, 0, "config.id must not be zero");
-        let r = Raft::new(config, store, logger)?;
+        let r = Raft::new(config, store, logger).await?;
         let mut rn = RawNode {
             raft: r,
             prev_hs: Default::default(),
@@ -325,8 +325,8 @@ impl<T: Storage> RawNode<T> {
     /// The default logger is an `slog` to `log` adapter.
     #[cfg(feature = "default-logger")]
     #[allow(clippy::new_ret_no_self)]
-    pub fn with_default_logger(c: &Config, store: T) -> Result<Self> {
-        Self::new(c, store, &crate::default_logger())
+    pub async fn with_default_logger(c: &Config, store: T) -> Result<Self> {
+        Self::new(c, store, &crate::default_logger()).await
     }
 
     /// Sets priority of node.
@@ -339,19 +339,19 @@ impl<T: Storage> RawNode<T> {
     ///
     /// Returns true to indicate that there will probably be some readiness which
     /// needs to be handled.
-    pub fn tick(&mut self) -> bool {
-        self.raft.tick()
+    pub async fn tick(&mut self) -> bool {
+        self.raft.tick().await
     }
 
     /// Campaign causes this RawNode to transition to candidate state.
-    pub fn campaign(&mut self) -> Result<()> {
+    pub async fn campaign(&mut self) -> Result<()> {
         let mut m = Message::default();
         m.set_msg_type(MessageType::MsgHup);
-        self.raft.step(m)
+        self.raft.step(m).await
     }
 
     /// Propose proposes data be appended to the raft log.
-    pub fn propose(&mut self, context: Vec<u8>, data: Vec<u8>) -> Result<()> {
+    pub async fn propose(&mut self, context: Vec<u8>, data: Vec<u8>) -> Result<()> {
         let mut m = Message::default();
         m.set_msg_type(MessageType::MsgPropose);
         m.from = self.raft.id;
@@ -359,7 +359,7 @@ impl<T: Storage> RawNode<T> {
         e.data = data.into();
         e.context = context.into();
         m.entries = vec![e];
-        self.raft.step(m)
+        self.raft.step(m).await
     }
 
     /// Broadcast heartbeats to all the followers.
@@ -375,7 +375,11 @@ impl<T: Storage> RawNode<T> {
     /// caller's responsibility to propose an empty conf change again to force
     /// leaving joint state.
     #[cfg_attr(feature = "cargo-clippy", allow(clippy::needless_pass_by_value))]
-    pub fn propose_conf_change(&mut self, context: Vec<u8>, cc: impl ConfChangeI) -> Result<()> {
+    pub async fn propose_conf_change(
+        &mut self,
+        context: Vec<u8>,
+        cc: impl ConfChangeI,
+    ) -> Result<()> {
         let (data, ty) = if let Some(cc) = cc.as_v1() {
             (cc.encode_to_vec(), EntryType::EntryConfChange)
         } else {
@@ -388,24 +392,24 @@ impl<T: Storage> RawNode<T> {
         e.data = data.into();
         e.context = context.into();
         m.entries = vec![e];
-        self.raft.step(m)
+        self.raft.step(m).await
     }
 
     /// Applies a config change to the local node. The app must call this when it
     /// applies a configuration change, except when it decides to reject the
     /// configuration change, in which case no call must take place.
-    pub fn apply_conf_change(&mut self, cc: &impl ConfChangeI) -> Result<ConfState> {
-        self.raft.apply_conf_change(&cc.as_v2())
+    pub async fn apply_conf_change(&mut self, cc: &impl ConfChangeI) -> Result<ConfState> {
+        self.raft.apply_conf_change(cc.as_v2().as_ref()).await
     }
 
     /// Step advances the state machine using the given message.
-    pub fn step(&mut self, m: Message) -> Result<()> {
+    pub async fn step(&mut self, m: Message) -> Result<()> {
         // Ignore unexpected local messages receiving over network
         if is_local_msg(m.msg_type()) {
             return Err(Error::StepLocalMsg);
         }
         if self.raft.prs().get(m.from).is_some() || !is_response_msg(m.msg_type()) {
-            return self.raft.step(m);
+            return self.raft.step(m).await;
         }
         Err(Error::StepPeerNotFound)
     }
@@ -417,7 +421,7 @@ impl<T: Storage> RawNode<T> {
     /// # Panics
     ///
     /// Panics if passed with the context of context.can_async() == false
-    pub fn on_entries_fetched(&mut self, context: GetEntriesContext) {
+    pub async fn on_entries_fetched(&mut self, context: GetEntriesContext) {
         match context.0 {
             GetEntriesFor::SendAppend {
                 to,
@@ -434,9 +438,9 @@ impl<T: Storage> RawNode<T> {
                 }
 
                 if aggressively {
-                    self.raft.send_append_aggressively(to)
+                    self.raft.send_append_aggressively(to).await
                 } else {
-                    self.raft.send_append(to)
+                    self.raft.send_append(to).await
                 }
             }
             GetEntriesFor::Empty(can_async) if can_async => {}
@@ -445,13 +449,14 @@ impl<T: Storage> RawNode<T> {
     }
 
     /// Generates a LightReady that has the committed entries and messages but no commit index.
-    fn gen_light_ready(&mut self) -> LightReady {
+    async fn gen_light_ready(&mut self) -> LightReady {
         let mut rd = LightReady::default();
         let max_size = Some(self.raft.max_committed_size_per_ready);
         let raft = &mut self.raft;
         rd.committed_entries = raft
             .raft_log
             .next_entries_since(self.commit_since_index, max_size)
+            .await
             .unwrap_or_default();
         // Update raft uncommitted entries size
         raft.reduce_uncommitted_size(&rd.committed_entries);
@@ -475,7 +480,7 @@ impl<T: Storage> RawNode<T> {
     /// `step`, `propose`, `campaign` to change internal state.
     ///
     /// [`Self::has_ready`] should be called first to check if it's necessary to handle the ready.
-    pub fn ready(&mut self) -> Ready {
+    pub async fn ready(&mut self) -> Ready {
         let raft = &mut self.raft;
 
         self.max_number += 1;
@@ -523,7 +528,8 @@ impl<T: Storage> RawNode<T> {
             assert!(
                 !raft
                     .raft_log
-                    .has_next_entries_since(self.commit_since_index),
+                    .has_next_entries_since(self.commit_since_index)
+                    .await,
                 "has snapshot but also has committed entries since {}",
                 self.commit_since_index
             );
@@ -544,13 +550,13 @@ impl<T: Storage> RawNode<T> {
         // Leader can send messages immediately to make replication concurrently.
         // For more details, check raft thesis 10.2.1.
         rd.is_persisted_msg = raft.state != StateRole::Leader;
-        rd.light = self.gen_light_ready();
+        rd.light = self.gen_light_ready().await;
         self.records.push_back(rd_record);
         rd
     }
 
     /// HasReady called when RawNode user need to check if any Ready pending.
-    pub fn has_ready(&self) -> bool {
+    pub async fn has_ready(&self) -> bool {
         let raft = &self.raft;
         if !raft.msgs.is_empty() {
             return true;
@@ -578,6 +584,7 @@ impl<T: Storage> RawNode<T> {
         if raft
             .raft_log
             .has_next_entries_since(self.commit_since_index)
+            .await
         {
             return true;
         }
@@ -603,8 +610,8 @@ impl<T: Storage> RawNode<T> {
         }
     }
 
-    fn commit_apply(&mut self, applied: u64) {
-        self.raft.commit_apply(applied);
+    async fn commit_apply(&mut self, applied: u64) {
+        self.raft.commit_apply(applied).await;
     }
 
     /// Notifies that the ready of this number has been persisted.
@@ -614,7 +621,7 @@ impl<T: Storage> RawNode<T> {
     ///
     /// [`Self::has_ready`] and [`Self::ready`] should be called later to handle further
     /// updates that become valid after ready being persisted.
-    pub fn on_persist_ready(&mut self, number: u64) {
+    pub async fn on_persist_ready(&mut self, number: u64) {
         let (mut index, mut term) = (0, 0);
         let mut snap_index = 0;
         while let Some(record) = self.records.front() {
@@ -638,7 +645,7 @@ impl<T: Storage> RawNode<T> {
             self.raft.on_persist_snap(snap_index);
         }
         if index != 0 {
-            self.raft.on_persist_entries(index, term);
+            self.raft.on_persist_entries(index, term).await;
         }
     }
 
@@ -651,10 +658,10 @@ impl<T: Storage> RawNode<T> {
     /// contains updates that only valid after persisting last ready. It should also be fully processed.
     /// Then [`Self::advance_apply`] or [`Self::advance_apply_to`] should be used later to update applying
     /// progress.
-    pub fn advance(&mut self, rd: Ready) -> LightReady {
+    pub async fn advance(&mut self, rd: Ready) -> LightReady {
         let applied = self.commit_since_index;
-        let light_rd = self.advance_append(rd);
-        self.advance_apply_to(applied);
+        let light_rd = self.advance_append(rd).await;
+        self.advance_apply_to(applied).await;
         light_rd
     }
 
@@ -666,10 +673,10 @@ impl<T: Storage> RawNode<T> {
     /// Since Ready must be persisted in order, calling this function implicitly means
     /// all ready collected before have been persisted.
     #[inline]
-    pub fn advance_append(&mut self, rd: Ready) -> LightReady {
+    pub async fn advance_append(&mut self, rd: Ready) -> LightReady {
         self.commit_ready(rd);
-        self.on_persist_ready(self.max_number);
-        let mut light_rd = self.gen_light_ready();
+        self.on_persist_ready(self.max_number).await;
+        let mut light_rd = self.gen_light_ready().await;
         if self.raft.state != StateRole::Leader && !light_rd.messages().is_empty() {
             fatal!(self.raft.logger, "not leader but has new msg after advance");
         }
@@ -700,14 +707,14 @@ impl<T: Storage> RawNode<T> {
 
     /// Advance apply to the index of the last committed entries given before.
     #[inline]
-    pub fn advance_apply(&mut self) {
-        self.commit_apply(self.commit_since_index);
+    pub async fn advance_apply(&mut self) {
+        self.commit_apply(self.commit_since_index).await;
     }
 
     /// Advance apply to the passed index.
     #[inline]
-    pub fn advance_apply_to(&mut self, applied: u64) {
-        self.commit_apply(applied);
+    pub async fn advance_apply_to(&mut self, applied: u64) {
+        self.commit_apply(applied).await;
     }
 
     /// Grabs the snapshot from the raft if available.
@@ -723,50 +730,50 @@ impl<T: Storage> RawNode<T> {
     }
 
     /// ReportUnreachable reports the given node is not reachable for the last send.
-    pub fn report_unreachable(&mut self, id: u64) {
+    pub async fn report_unreachable(&mut self, id: u64) {
         let mut m = Message::default();
         m.set_msg_type(MessageType::MsgUnreachable);
         m.from = id;
         // we don't care if it is ok actually
-        let _ = self.raft.step(m);
+        let _ = self.raft.step(m).await;
     }
 
     /// ReportSnapshot reports the status of the sent snapshot.
-    pub fn report_snapshot(&mut self, id: u64, status: SnapshotStatus) {
+    pub async fn report_snapshot(&mut self, id: u64, status: SnapshotStatus) {
         let rej = status == SnapshotStatus::Failure;
         let mut m = Message::default();
         m.set_msg_type(MessageType::MsgSnapStatus);
         m.from = id;
         m.reject = rej;
         // we don't care if it is ok actually
-        let _ = self.raft.step(m);
+        let _ = self.raft.step(m).await;
     }
 
     /// Request a snapshot from a leader.
     /// The snapshot's index must be greater or equal to the request_index.
-    pub fn request_snapshot(&mut self, request_index: u64) -> Result<()> {
-        self.raft.request_snapshot(request_index)
+    pub async fn request_snapshot(&mut self, request_index: u64) -> Result<()> {
+        self.raft.request_snapshot(request_index).await
     }
 
     /// TransferLeader tries to transfer leadership to the given transferee.
-    pub fn transfer_leader(&mut self, transferee: u64) {
+    pub async fn transfer_leader(&mut self, transferee: u64) {
         let mut m = Message::default();
         m.set_msg_type(MessageType::MsgTransferLeader);
         m.from = transferee;
-        let _ = self.raft.step(m);
+        let _ = self.raft.step(m).await;
     }
 
     /// ReadIndex requests a read state. The read state will be set in ready.
     /// Read State has a read index. Once the application advances further than the read
     /// index, any linearizable read requests issued before the read request can be
     /// processed safely. The read state will have the same rctx attached.
-    pub fn read_index(&mut self, rctx: Vec<u8>) {
+    pub async fn read_index(&mut self, rctx: Vec<u8>) {
         let mut m = Message::default();
         m.set_msg_type(MessageType::MsgReadIndex);
         let mut e = Entry::default();
         e.data = rctx.into();
         m.entries = vec![e];
-        let _ = self.raft.step(m);
+        let _ = self.raft.step(m).await;
     }
 
     /// Returns the store as an immutable reference.

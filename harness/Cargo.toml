@@ -17,11 +17,19 @@ prost-codec = ["raft/prost-codec"]
 
 # Make sure to synchronize updates with Raft.
 [dependencies]
+async-trait = "0.1"
+futures = "0.3"
 prost = "0.9"
 raft = { path = "..", default-features = false }
 raft-proto = { path = "../proto", default-features = false }
 rand = "0.8"
 slog = "2.2"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "sync",
+    "macros",
+    "time",
+] }
 
 [dev-dependencies]
 criterion = "0.3"

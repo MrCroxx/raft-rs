@@ -38,9 +38,9 @@ impl Interface {
     }
 
     /// Step the raft, if it exists.
-    pub fn step(&mut self, m: Message) -> Result<()> {
+    pub async fn step(&mut self, m: Message) -> Result<()> {
         match self.raft {
-            Some(_) => Raft::step(self, m),
+            Some(_) => Raft::step(self, m).await,
             None => Ok(()),
         }
     }
@@ -54,7 +54,7 @@ impl Interface {
     }
 
     /// Persist the unstable snapshot and entries.
-    pub fn persist(&mut self) {
+    pub async fn persist(&mut self) {
         if self.raft.is_some() {
             if let Some(snapshot) = self.raft_log.unstable_snapshot() {
                 let snap = snapshot.clone();
@@ -62,14 +62,14 @@ impl Interface {
                 self.raft_log.stable_snap(index);
                 self.mut_store().wl().apply_snapshot(snap).expect("");
                 self.on_persist_snap(index);
-                self.commit_apply(index);
+                self.commit_apply(index).await;
             }
             let unstable = self.raft_log.unstable_entries().to_vec();
             if let Some(e) = unstable.last() {
                 let (last_idx, last_term) = (e.index, e.term);
                 self.raft_log.stable_entries(last_idx, last_term);
                 self.mut_store().wl().append(&unstable).expect("");
-                self.on_persist_entries(last_idx, last_term);
+                self.on_persist_entries(last_idx, last_term).await;
             }
         }
     }

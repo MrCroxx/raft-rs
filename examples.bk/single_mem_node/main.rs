@@ -27,11 +27,12 @@ enum Msg {
 }
 
 // A simple example about how to use the Raft library in Rust.
-fn main() {
+#[tokio::main]
+async fn main() {
     // Create a storage for Raft, and here we just use a simple memory storage.
     // You need to build your own persistent storage in your production.
     // Please check the Storage trait in src/storage.rs to see how to implement one.
-    let storage = MemStorage::new_with_conf_state(ConfState::from((vec![1], vec![])));
+    let storage = MemStorage::new_with_conf_state(ConfState::from((vec![1], vec![]))).await;
 
     let decorator = slog_term::TermDecorator::new().build();
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
@@ -64,7 +65,7 @@ fn main() {
     };
 
     // Create the Raft node.
-    let mut r = RawNode::new(&cfg, storage, &logger).unwrap();
+    let mut r = RawNode::new(&cfg, storage, &logger).await.unwrap();
 
     let (sender, receiver) = mpsc::channel();
 
@@ -82,9 +83,9 @@ fn main() {
         match receiver.recv_timeout(timeout) {
             Ok(Msg::Propose { id, cb }) => {
                 cbs.insert(id, cb);
-                r.propose(vec![], vec![id]).unwrap();
+                r.propose(vec![], vec![id]).await.unwrap();
             }
-            Ok(Msg::Raft(m)) => r.step(m).unwrap(),
+            Ok(Msg::Raft(m)) => r.step(m).await.unwrap(),
             Err(RecvTimeoutError::Timeout) => (),
             Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -98,18 +99,18 @@ fn main() {
         } else {
             timeout -= d;
         }
-        on_ready(&mut r, &mut cbs);
+        on_ready(&mut r, &mut cbs).await;
     }
 }
 
-fn on_ready(raft_group: &mut RawNode<MemStorage>, cbs: &mut HashMap<u8, ProposeCallback>) {
-    if !raft_group.has_ready() {
+async fn on_ready(raft_group: &mut RawNode<MemStorage>, cbs: &mut HashMap<u8, ProposeCallback>) {
+    if !raft_group.has_ready().await {
         return;
     }
     let store = raft_group.raft.raft_log.store.clone();
 
     // Get the `Ready` with `RawNode::ready` interface.
-    let mut ready = raft_group.ready();
+    let mut ready = raft_group.ready().await;
 
     let handle_messages = |msgs: Vec<Message>| {
         for _msg in msgs {
@@ -166,7 +167,7 @@ fn on_ready(raft_group: &mut RawNode<MemStorage>, cbs: &mut HashMap<u8, ProposeC
     }
 
     // Advance the Raft.
-    let mut light_rd = raft_group.advance(ready);
+    let mut light_rd = raft_group.advance(ready).await;
     // Update commit index.
     if let Some(commit) = light_rd.commit_index() {
         store.wl().mut_hard_state().commit = commit;
@@ -176,7 +177,7 @@ fn on_ready(raft_group: &mut RawNode<MemStorage>, cbs: &mut HashMap<u8, ProposeC
     // Apply all committed entries.
     handle_committed_entries(light_rd.take_committed_entries());
     // Advance the apply index.
-    raft_group.advance_apply();
+    raft_group.advance_apply().await;
 }
 
 fn send_propose(logger: Logger, sender: mpsc::Sender<Msg>) {
