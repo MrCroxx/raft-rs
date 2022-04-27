@@ -28,6 +28,7 @@ use crate::eraftpb::*;
 use crate::errors::{Error, Result, StorageError};
 use crate::util::limit_size;
 
+use async_trait::async_trait;
 use getset::{Getters, Setters};
 
 /// Holds both the hard state (commit index, vote leader, term) and the configuration state
@@ -103,13 +104,14 @@ pub(crate) enum GetEntriesFor {
 /// If any Storage method returns an error, the raft instance will
 /// become inoperable and refuse to participate in elections; the
 /// application is responsible for cleanup and recovery in this case.
-pub trait Storage {
+#[async_trait]
+pub trait Storage: Send + Sync + 'static {
     /// `initial_state` is called when Raft is initialized. This interface will return a `RaftState`
     /// which contains `HardState` and `ConfState`.
     ///
     /// `RaftState` could be initialized or not. If it's initialized it means the `Storage` is
     /// created with a configuration, and its last index and term should be greater than 0.
-    fn initial_state(&self) -> Result<RaftState>;
+    async fn initial_state(&self) -> Result<RaftState>;
 
     /// Returns a slice of log entries in the range `[low, high)`.
     /// max_size limits the total size of the log entries returned if not `None`, however
@@ -125,11 +127,11 @@ pub trait Storage {
     /// # Panics
     ///
     /// Panics if `high` is higher than `Storage::last_index(&self) + 1`.
-    fn entries(
+    async fn entries(
         &self,
         low: u64,
         high: u64,
-        max_size: impl Into<Option<u64>>,
+        max_size: Option<u64>,
         context: GetEntriesContext,
     ) -> Result<Vec<Entry>>;
 
@@ -137,17 +139,17 @@ pub trait Storage {
     /// [first_index()-1, last_index()]. The term of the entry before
     /// first_index is retained for matching purpose even though the
     /// rest of that entry may not be available.
-    fn term(&self, idx: u64) -> Result<u64>;
+    async fn term(&self, idx: u64) -> Result<u64>;
 
     /// Returns the index of the first log entry that is possible available via entries, which will
     /// always equal to `truncated index` plus 1.
     ///
     /// New created (but not initialized) `Storage` can be considered as truncated at 0 so that 1
     /// will be returned in this case.
-    fn first_index(&self) -> Result<u64>;
+    async fn first_index(&self) -> Result<u64>;
 
     /// The index of the last entry replicated in the `Storage`.
-    fn last_index(&self) -> Result<u64>;
+    async fn last_index(&self) -> Result<u64>;
 
     /// Returns the most recent snapshot.
     ///
@@ -156,7 +158,7 @@ pub trait Storage {
     /// snapshot and call snapshot later.
     /// A snapshot's index must not less than the `request_index`.
     /// `to` indicates which peer is requesting the snapshot.
-    fn snapshot(&self, request_index: u64, to: u64) -> Result<Snapshot>;
+    async fn snapshot(&self, request_index: u64, to: u64) -> Result<Snapshot>;
 }
 
 /// The Memory Storage Core instance holds the actual state of the storage struct. To access this
@@ -401,23 +403,23 @@ impl MemStorage {
     /// initialize the storage.
     ///
     /// You should use the same input to initialize all nodes.
-    pub fn new_with_conf_state<T>(conf_state: T) -> MemStorage
+    pub async fn new_with_conf_state<T>(conf_state: T) -> MemStorage
     where
         ConfState: From<T>,
     {
         let store = MemStorage::new();
-        store.initialize_with_conf_state(conf_state);
+        store.initialize_with_conf_state(conf_state).await;
         store
     }
 
     /// Initialize a `MemStorage` with a given `Config`.
     ///
     /// You should use the same input to initialize all nodes.
-    pub fn initialize_with_conf_state<T>(&self, conf_state: T)
+    pub async fn initialize_with_conf_state<T>(&self, conf_state: T)
     where
         ConfState: From<T>,
     {
-        assert!(!self.initial_state().unwrap().initialized());
+        assert!(!self.initial_state().await.unwrap().initialized());
         let mut core = self.wl();
         // Setting initial state is very important to build a correct raft, as raft algorithm
         // itself only guarantees logs consistency. Typically, you need to ensure either all start
@@ -441,21 +443,21 @@ impl MemStorage {
     }
 }
 
+#[async_trait]
 impl Storage for MemStorage {
     /// Implements the Storage trait.
-    fn initial_state(&self) -> Result<RaftState> {
+    async fn initial_state(&self) -> Result<RaftState> {
         Ok(self.rl().raft_state.clone())
     }
 
     /// Implements the Storage trait.
-    fn entries(
+    async fn entries(
         &self,
         low: u64,
         high: u64,
-        max_size: impl Into<Option<u64>>,
+        max_size: Option<u64>,
         context: GetEntriesContext,
     ) -> Result<Vec<Entry>> {
-        let max_size = max_size.into();
         let mut core = self.wl();
         if low < core.first_index() {
             return Err(Error::Store(StorageError::Compacted));
@@ -483,7 +485,7 @@ impl Storage for MemStorage {
     }
 
     /// Implements the Storage trait.
-    fn term(&self, idx: u64) -> Result<u64> {
+    async fn term(&self, idx: u64) -> Result<u64> {
         let core = self.rl();
         if idx == core.snapshot_metadata.index {
             return Ok(core.snapshot_metadata.term);
@@ -501,17 +503,17 @@ impl Storage for MemStorage {
     }
 
     /// Implements the Storage trait.
-    fn first_index(&self) -> Result<u64> {
+    async fn first_index(&self) -> Result<u64> {
         Ok(self.rl().first_index())
     }
 
     /// Implements the Storage trait.
-    fn last_index(&self) -> Result<u64> {
+    async fn last_index(&self) -> Result<u64> {
         Ok(self.rl().last_index())
     }
 
     /// Implements the Storage trait.
-    fn snapshot(&self, request_index: u64, _to: u64) -> Result<Snapshot> {
+    async fn snapshot(&self, request_index: u64, _to: u64) -> Result<Snapshot> {
         let mut core = self.wl();
         if core.trigger_snap_unavailable {
             core.trigger_snap_unavailable = false;
@@ -566,8 +568,8 @@ mod test {
         }
     }
 
-    #[test]
-    fn test_storage_term() {
+    #[tokio::test]
+    async fn test_storage_term() {
         let ents = vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)];
         let mut tests = vec![
             (2, Err(RaftError::Store(StorageError::Compacted))),
@@ -581,15 +583,15 @@ mod test {
             let storage = MemStorage::new();
             storage.wl().entries = ents.clone();
 
-            let t = storage.term(idx);
+            let t = storage.term(idx).await;
             if t != wterm {
                 panic!("#{}: expect res {:?}, got {:?}", i, wterm, t);
             }
         }
     }
 
-    #[test]
-    fn test_storage_entries() {
+    #[tokio::test]
+    async fn test_storage_entries() {
         let ents = vec![
             new_entry(3, 3),
             new_entry(4, 4),
@@ -645,46 +647,48 @@ mod test {
         for (i, (lo, hi, maxsize, wentries)) in tests.drain(..).enumerate() {
             let storage = MemStorage::new();
             storage.wl().entries = ents.clone();
-            let e = storage.entries(lo, hi, maxsize, GetEntriesContext::empty(false));
+            let e = storage
+                .entries(lo, hi, Some(maxsize), GetEntriesContext::empty(false))
+                .await;
             if e != wentries {
                 panic!("#{}: expect entries {:?}, got {:?}", i, wentries, e);
             }
         }
     }
 
-    #[test]
-    fn test_storage_last_index() {
+    #[tokio::test]
+    async fn test_storage_last_index() {
         let ents = vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)];
         let storage = MemStorage::new();
         storage.wl().entries = ents;
 
         let wresult = Ok(5);
-        let result = storage.last_index();
+        let result = storage.last_index().await;
         if result != wresult {
             panic!("want {:?}, got {:?}", wresult, result);
         }
 
         storage.wl().append(&[new_entry(6, 5)]).unwrap();
         let wresult = Ok(6);
-        let result = storage.last_index();
+        let result = storage.last_index().await;
         if result != wresult {
             panic!("want {:?}, got {:?}", wresult, result);
         }
     }
 
-    #[test]
-    fn test_storage_first_index() {
+    #[tokio::test]
+    async fn test_storage_first_index() {
         let ents = vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)];
         let storage = MemStorage::new();
         storage.wl().entries = ents;
 
-        assert_eq!(storage.first_index(), Ok(3));
+        assert_eq!(storage.first_index().await, Ok(3));
         storage.wl().compact(4).unwrap();
-        assert_eq!(storage.first_index(), Ok(4));
+        assert_eq!(storage.first_index().await, Ok(4));
     }
 
-    #[test]
-    fn test_storage_compact() {
+    #[tokio::test]
+    async fn test_storage_compact() {
         let ents = vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)];
         let mut tests = vec![(2, 3, 3, 3), (3, 3, 3, 3), (4, 4, 4, 2), (5, 5, 5, 1)];
         for (i, (idx, windex, wterm, wlen)) in tests.drain(..).enumerate() {
@@ -692,12 +696,13 @@ mod test {
             storage.wl().entries = ents.clone();
 
             storage.wl().compact(idx).unwrap();
-            let index = storage.first_index().unwrap();
+            let index = storage.first_index().await.unwrap();
             if index != windex {
                 panic!("#{}: want {}, index {}", i, windex, index);
             }
-            let term = if let Ok(v) =
-                storage.entries(index, index + 1, 1, GetEntriesContext::empty(false))
+            let term = if let Ok(v) = storage
+                .entries(index, index + 1, Some(1), GetEntriesContext::empty(false))
+                .await
             {
                 v.first().map_or(0, |e| e.term)
             } else {
@@ -706,9 +711,10 @@ mod test {
             if term != wterm {
                 panic!("#{}: want {}, term {}", i, wterm, term);
             }
-            let last = storage.last_index().unwrap();
+            let last = storage.last_index().await.unwrap();
             let len = storage
-                .entries(index, last + 1, 100, GetEntriesContext::empty(false))
+                .entries(index, last + 1, Some(100), GetEntriesContext::empty(false))
+                .await
                 .unwrap()
                 .len();
             if len != wlen {
@@ -717,8 +723,8 @@ mod test {
         }
     }
 
-    #[test]
-    fn test_storage_create_snapshot() {
+    #[tokio::test]
+    async fn test_storage_create_snapshot() {
         let ents = vec![new_entry(3, 3), new_entry(4, 4), new_entry(5, 5)];
         let nodes = vec![1, 2, 3];
         let mut conf_state = ConfState::default();
@@ -744,7 +750,7 @@ mod test {
                 storage.wl().trigger_snap_unavailable();
             }
 
-            let result = storage.snapshot(windex, 0);
+            let result = storage.snapshot(windex, 0).await;
             if result != wresult {
                 panic!("#{}: want {:?}, got {:?}", i, wresult, result);
             }

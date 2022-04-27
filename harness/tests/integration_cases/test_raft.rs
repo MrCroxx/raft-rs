@@ -16,8 +16,9 @@
 
 use std::cmp;
 use std::collections::HashMap;
-use std::panic::{self, AssertUnwindSafe};
+use std::panic;
 
+use futures::FutureExt;
 use harness::*;
 use prost::Message as PbMessage;
 use raft::eraftpb::*;
@@ -35,26 +36,26 @@ fn read_messages<T: Storage>(raft: &mut Raft<T>) -> Vec<Message> {
     raft.msgs.drain(..).collect()
 }
 
-fn ents_with_config(
+async fn ents_with_config(
     terms: &[u64],
     pre_vote: bool,
     id: u64,
     peers: Vec<u64>,
     l: &Logger,
 ) -> Interface {
-    let store = MemStorage::new_with_conf_state((peers.clone(), vec![]));
+    let store = MemStorage::new_with_conf_state((peers.clone(), vec![])).await;
     for (i, term) in terms.iter().enumerate() {
         let mut e = Entry::default();
         e.index = i as u64 + 1;
         e.term = *term;
         store.wl().append(&[e]).expect("");
     }
-    let mut raft = new_test_raft_with_prevote(id, peers, 5, 1, store, pre_vote, l);
-    raft.reset(terms[terms.len() - 1]);
+    let mut raft = new_test_raft_with_prevote(id, peers, 5, 1, store, pre_vote, l).await;
+    raft.reset(terms[terms.len() - 1]).await;
     raft
 }
 
-fn assert_raft_log(
+async fn assert_raft_log(
     prefix: &str,
     raft_log: &RaftLog<MemStorage>,
     (committed, applied, last): (u64, u64, u64),
@@ -70,11 +71,11 @@ fn assert_raft_log(
         prefix, raft_log.applied, applied
     );
     assert_eq!(
-        raft_log.last_index(),
+        raft_log.last_index().await,
         last,
         "{}last_index = {}, want = {}",
         prefix,
-        raft_log.last_index(),
+        raft_log.last_index().await,
         last
     );
 }
@@ -82,7 +83,7 @@ fn assert_raft_log(
 // voted_with_config creates a raft state machine with vote and term set
 // to the given value but no log entries (indicating that it voted in
 // the given term but has not receive any logs).
-fn voted_with_config(
+async fn voted_with_config(
     vote: u64,
     term: u64,
     pre_vote: bool,
@@ -90,40 +91,41 @@ fn voted_with_config(
     peers: Vec<u64>,
     l: &Logger,
 ) -> Interface {
-    let store = MemStorage::new_with_conf_state((peers.clone(), vec![]));
+    let store = MemStorage::new_with_conf_state((peers.clone(), vec![])).await;
     store.wl().mut_hard_state().vote = vote;
     store.wl().mut_hard_state().term = term;
-    let mut raft = new_test_raft_with_prevote(id, peers, 5, 1, store, pre_vote, l);
-    raft.reset(term);
+    let mut raft = new_test_raft_with_prevote(id, peers, 5, 1, store, pre_vote, l).await;
+    raft.reset(term).await;
     raft
 }
 
 // Persist committed index and fetch next entries.
-fn next_ents(r: &mut Raft<MemStorage>, s: &MemStorage) -> Vec<Entry> {
+async fn next_ents(r: &mut Raft<MemStorage>, s: &MemStorage) -> Vec<Entry> {
     let unstable = r.raft_log.unstable_entries().to_vec();
     if let Some(e) = unstable.last() {
         let (last_idx, last_term) = (e.index, e.term);
         r.raft_log.stable_entries(last_idx, last_term);
         s.wl().append(&unstable).expect("");
-        r.on_persist_entries(last_idx, last_term);
+        r.on_persist_entries(last_idx, last_term).await;
     }
-    let ents = r.raft_log.next_entries(None);
-    r.commit_apply(r.raft_log.committed);
+    let ents = r.raft_log.next_entries(None).await;
+    r.commit_apply(r.raft_log.committed).await;
     ents.unwrap_or_default()
 }
 
-#[test]
-fn test_progress_committed_index() {
+#[tokio::test]
+async fn test_progress_committed_index() {
     let l = default_logger();
-    let mut nt = Network::new(vec![None, None, None], &l);
+    let mut nt = Network::new(vec![None, None, None], &l).await;
 
     // set node 1 as Leader
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
 
-    assert_raft_log("#1: ", &nt.peers[&1].raft_log, (1, 0, 1));
-    assert_raft_log("#2: ", &nt.peers[&2].raft_log, (1, 0, 1));
-    assert_raft_log("#3: ", &nt.peers[&3].raft_log, (1, 0, 1));
+    assert_raft_log("#1: ", &nt.peers[&1].raft_log, (1, 0, 1)).await;
+    assert_raft_log("#2: ", &nt.peers[&2].raft_log, (1, 0, 1)).await;
+    assert_raft_log("#3: ", &nt.peers[&3].raft_log, (1, 0, 1)).await;
 
     assert_eq!(
         (
@@ -140,12 +142,12 @@ fn test_progress_committed_index() {
     test_entries.data = (b"testdata" as &'static [u8]).into();
     let m = new_message_with_entries(1, 1, MessageType::MsgPropose, vec![test_entries]);
     nt.cut(1, 3);
-    nt.send(vec![m.clone(), m]);
+    nt.send(vec![m.clone(), m]).await;
     nt.recover();
 
-    assert_raft_log("#1: ", &nt.peers[&1].raft_log, (3, 0, 3));
-    assert_raft_log("#2: ", &nt.peers[&2].raft_log, (3, 0, 3));
-    assert_raft_log("#3: ", &nt.peers[&3].raft_log, (1, 0, 1));
+    assert_raft_log("#1: ", &nt.peers[&1].raft_log, (3, 0, 3)).await;
+    assert_raft_log("#2: ", &nt.peers[&2].raft_log, (3, 0, 3)).await;
+    assert_raft_log("#3: ", &nt.peers[&3].raft_log, (1, 0, 1)).await;
 
     assert_eq!(
         (
@@ -158,11 +160,11 @@ fn test_progress_committed_index() {
 
     // #2 test heartbeat
     let heartbeat = new_message(1, 1, MessageType::MsgBeat, 0);
-    nt.send(vec![heartbeat]);
+    nt.send(vec![heartbeat]).await;
 
-    assert_raft_log("#1: ", &nt.peers[&1].raft_log, (3, 0, 3));
-    assert_raft_log("#2: ", &nt.peers[&2].raft_log, (3, 0, 3));
-    assert_raft_log("#3: ", &nt.peers[&3].raft_log, (3, 0, 3));
+    assert_raft_log("#1: ", &nt.peers[&1].raft_log, (3, 0, 3)).await;
+    assert_raft_log("#2: ", &nt.peers[&2].raft_log, (3, 0, 3)).await;
+    assert_raft_log("#3: ", &nt.peers[&3].raft_log, (3, 0, 3)).await;
 
     assert_eq!(
         (
@@ -174,12 +176,13 @@ fn test_progress_committed_index() {
     );
 
     // set node 2 as Leader
-    nt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)])
+        .await;
     assert_eq!(nt.peers[&2].state, StateRole::Leader);
 
-    assert_raft_log("#1: ", &nt.peers[&1].raft_log, (4, 0, 4));
-    assert_raft_log("#2: ", &nt.peers[&2].raft_log, (4, 0, 4));
-    assert_raft_log("#3: ", &nt.peers[&3].raft_log, (4, 0, 4));
+    assert_raft_log("#1: ", &nt.peers[&1].raft_log, (4, 0, 4)).await;
+    assert_raft_log("#2: ", &nt.peers[&2].raft_log, (4, 0, 4)).await;
+    assert_raft_log("#3: ", &nt.peers[&3].raft_log, (4, 0, 4)).await;
 
     assert_eq!(
         (
@@ -192,22 +195,24 @@ fn test_progress_committed_index() {
 
     // #3 test append entries rejection (fails to update committed index)
     nt.isolate(2);
-    nt.send(vec![new_message(2, 2, MessageType::MsgPropose, 2)]);
+    nt.send(vec![new_message(2, 2, MessageType::MsgPropose, 2)])
+        .await;
     nt.recover();
     nt.dispatch(vec![new_message(2, 2, MessageType::MsgPropose, 1)])
+        .await
         .expect("");
 
     // [msg_type: MsgAppend to: 1 from: 2 term: 2 log_term: 2 index: 6 entries {term: 2 index: 7 data: "somedata"} commit: 4,
     // msg_type: MsgAppend to: 3 from: 2 term: 2 log_term: 2 index: 6 entries {term: 2 index: 7 data: "somedata"} commit: 4]
     let msg_append = nt.read_messages();
 
-    nt.dispatch(msg_append).expect("");
+    nt.dispatch(msg_append).await.expect("");
 
     // [msg_type: MsgAppendResponse to: 2 from: 1 term: 2 index: 6 commit: 4 reject: true reject_hint: 4,
     // msg_type: MsgAppendResponse to: 2 from: 3 term: 2 index: 6 commit: 4 reject: true reject_hint: 4]
     let msg_append_response = nt.read_messages();
 
-    nt.dispatch(msg_append_response).expect("");
+    nt.dispatch(msg_append_response).await.expect("");
 
     // [msg_type: MsgAppend to: 3 from: 2 term: 2 log_term: 2 index: 4 entries {term: 2 index: 5 data: "somedata"} entries {term: 2 index: 6 data: "somedata"} entries {term: 2 index: 7 data: "somedata"} commit: 4,
     // msg_type: MsgAppend to: 1 from: 2 term: 2 log_term: 2 index: 4 entries {term: 2 index: 5 data: "somedata"} entries {term: 2 index: 6 data: "somedata"} entries {term: 2 index: 7 data: "somedata"} commit: 4]
@@ -224,7 +229,7 @@ fn test_progress_committed_index() {
     );
 
     // resend append
-    nt.send(msg_append);
+    nt.send(msg_append).await;
 
     // log is up-to-date
     assert_eq!(
@@ -237,12 +242,13 @@ fn test_progress_committed_index() {
     );
 
     // set node 1 as Leader again
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
 
-    assert_raft_log("#1: ", &nt.peers[&1].raft_log, (8, 0, 8));
-    assert_raft_log("#2: ", &nt.peers[&2].raft_log, (8, 0, 8));
-    assert_raft_log("#3: ", &nt.peers[&3].raft_log, (8, 0, 8));
+    assert_raft_log("#1: ", &nt.peers[&1].raft_log, (8, 0, 8)).await;
+    assert_raft_log("#2: ", &nt.peers[&2].raft_log, (8, 0, 8)).await;
+    assert_raft_log("#3: ", &nt.peers[&3].raft_log, (8, 0, 8)).await;
 
     // update to 8
     assert_eq!(
@@ -260,19 +266,20 @@ fn test_progress_committed_index() {
         new_message(1, 1, MessageType::MsgPropose, 1),
         new_message(1, 1, MessageType::MsgPropose, 1),
     ])
+    .await
     .expect("");
     let msg_append = nt.read_messages();
-    nt.dispatch(msg_append).expect("");
+    nt.dispatch(msg_append).await.expect("");
     let msg_append_response = nt.read_messages();
-    nt.dispatch(msg_append_response).expect("");
+    nt.dispatch(msg_append_response).await.expect("");
     let msg_append = nt.read_messages();
-    nt.dispatch(msg_append).expect("");
+    nt.dispatch(msg_append).await.expect("");
     let mut msg_append_response = nt.read_messages();
     // m1: msg_type: MsgAppendResponse to: 1 from: 3 term: 3 index: 10 commit: 10
     // m2: msg_type: MsgAppendResponse to: 1 from: 2 term: 3 index: 10 commit: 10
     let m1 = msg_append_response.remove(1);
     let m2 = msg_append_response.remove(2);
-    nt.send(vec![m1, m2]);
+    nt.send(vec![m1, m2]).await;
 
     assert_eq!(
         (
@@ -287,7 +294,7 @@ fn test_progress_committed_index() {
 
     // msg_type: MsgAppendResponse to: 1 from: 2 term: 3 index: 10 commit: 9,
     // msg_type: MsgAppendResponse to: 1 from: 3 term: 3 index: 10 commit: 9
-    nt.send(msg_append_response);
+    nt.send(msg_append_response).await;
     assert_eq!(
         (
             nt.peers[&1].prs().get(1).unwrap().committed_index,
@@ -298,14 +305,14 @@ fn test_progress_committed_index() {
     );
 }
 
-#[test]
-fn test_progress_leader() {
+#[tokio::test]
+async fn test_progress_leader() {
     let l = default_logger();
-    let mut raft = new_test_raft(1, vec![1, 2], 5, 1, new_storage(), &l);
-    raft.become_candidate();
-    raft.become_leader();
+    let mut raft = new_test_raft(1, vec![1, 2], 5, 1, new_storage(), &l).await;
+    raft.become_candidate().await;
+    raft.become_leader().await;
     // For no-op entry
-    raft.persist();
+    raft.persist().await;
     raft.mut_prs().get_mut(2).unwrap().become_replicate();
 
     let prop_msg = new_message(1, 1, MessageType::MsgPropose, 1);
@@ -320,37 +327,39 @@ fn test_progress_leader() {
         assert_eq!(matched, i + 1);
         assert_eq!(next_idx, matched + 1);
 
-        raft.step(prop_msg.clone()).unwrap();
-        raft.persist();
+        raft.step(prop_msg.clone()).await.unwrap();
+        raft.persist().await;
     }
 }
 
 // test_progress_resume_by_heartbeat_resp ensures raft.heartbeat reset progress.paused by
 // heartbeat response.
-#[test]
-fn test_progress_resume_by_heartbeat_resp() {
+#[tokio::test]
+async fn test_progress_resume_by_heartbeat_resp() {
     let l = default_logger();
-    let mut raft = new_test_raft(1, vec![1, 2], 5, 1, new_storage(), &l);
-    raft.become_candidate();
-    raft.become_leader();
+    let mut raft = new_test_raft(1, vec![1, 2], 5, 1, new_storage(), &l).await;
+    raft.become_candidate().await;
+    raft.become_leader().await;
     raft.mut_prs().get_mut(2).unwrap().paused = true;
 
     raft.step(new_message(1, 1, MessageType::MsgBeat, 0))
+        .await
         .expect("");
     assert!(raft.prs().get(2).unwrap().paused);
 
     raft.mut_prs().get_mut(2).unwrap().become_replicate();
     raft.step(new_message(2, 1, MessageType::MsgHeartbeatResponse, 0))
+        .await
         .expect("");
     assert!(!raft.prs().get(2).unwrap().paused);
 }
 
-#[test]
-fn test_progress_paused() {
+#[tokio::test]
+async fn test_progress_paused() {
     let l = default_logger();
-    let mut raft = new_test_raft(1, vec![1, 2], 5, 1, new_storage(), &l);
-    raft.become_candidate();
-    raft.become_leader();
+    let mut raft = new_test_raft(1, vec![1, 2], 5, 1, new_storage(), &l).await;
+    raft.become_candidate().await;
+    raft.become_leader().await;
     let mut m = Message::default();
     m.from = 1;
     m.to = 1;
@@ -358,23 +367,23 @@ fn test_progress_paused() {
     let mut e = Entry::default();
     e.data = (b"some_data" as &'static [u8]).into();
     m.entries = vec![e];
-    raft.step(m.clone()).expect("");
-    raft.step(m.clone()).expect("");
-    raft.step(m).expect("");
+    raft.step(m.clone()).await.expect("");
+    raft.step(m.clone()).await.expect("");
+    raft.step(m).await.expect("");
     let ms = read_messages(&mut raft);
     assert_eq!(ms.len(), 1);
 }
 
-#[test]
-fn test_progress_flow_control() {
+#[tokio::test]
+async fn test_progress_flow_control() {
     let l = default_logger();
     let mut cfg = new_test_config(1, 5, 1);
     cfg.max_inflight_msgs = 3;
     cfg.max_size_per_msg = 2048;
-    let s = MemStorage::new_with_conf_state((vec![1, 2], vec![]));
-    let mut r = new_test_raft_with_config(&cfg, s, &l);
-    r.become_candidate();
-    r.become_leader();
+    let s = MemStorage::new_with_conf_state((vec![1, 2], vec![])).await;
+    let mut r = new_test_raft_with_config(&cfg, s, &l).await;
+    r.become_candidate().await;
+    r.become_leader().await;
 
     // Throw away all the messages relating to the initial election.
     r.read_messages();
@@ -389,7 +398,7 @@ fn test_progress_flow_control() {
             MessageType::MsgPropose,
             vec![new_entry(0, 0, Some(&data))],
         );
-        r.step(msg).unwrap();
+        r.step(msg).await.unwrap();
     }
 
     let mut ms = r.read_messages();
@@ -406,7 +415,7 @@ fn test_progress_flow_control() {
     // send multiple messages at once.
     let mut msg = new_message(2, 1, MessageType::MsgAppendResponse, 0);
     msg.index = ms[0].entries[1].index;
-    r.step(msg).unwrap();
+    r.step(msg).await.unwrap();
     ms = r.read_messages();
     assert_eq!(ms.len(), 3);
     for (i, m) in ms.iter().enumerate() {
@@ -422,7 +431,7 @@ fn test_progress_flow_control() {
     // messages (containing three entries).
     let mut msg = new_message(2, 1, MessageType::MsgAppendResponse, 0);
     msg.index = ms[2].entries[1].index;
-    r.step(msg).unwrap();
+    r.step(msg).await.unwrap();
     ms = r.read_messages();
     assert_eq!(ms.len(), 2);
     for (i, m) in ms.iter().enumerate() {
@@ -434,44 +443,45 @@ fn test_progress_flow_control() {
     assert_eq!(ms[1].entries.len(), 1);
 }
 
-#[test]
-fn test_leader_election() {
+#[tokio::test]
+async fn test_leader_election() {
     let l = default_logger();
-    test_leader_election_with_config(false, &l);
+    test_leader_election_with_config(false, &l).await;
 }
 
-#[test]
-fn test_leader_election_pre_vote() {
+#[tokio::test]
+async fn test_leader_election_pre_vote() {
     let l = default_logger();
-    test_leader_election_with_config(true, &l);
+    test_leader_election_with_config(true, &l).await;
 }
 
-fn test_leader_election_with_config(pre_vote: bool, l: &Logger) {
+async fn test_leader_election_with_config(pre_vote: bool, l: &Logger) {
     let mut config = Network::default_config();
     config.pre_vote = pre_vote;
     let mut tests = vec![
         (
-            Network::new_with_config(vec![None, None, None], &config, l),
+            Network::new_with_config(vec![None, None, None], &config, l).await,
             StateRole::Leader,
             1,
         ),
         (
-            Network::new_with_config(vec![None, None, NOP_STEPPER], &config, l),
+            Network::new_with_config(vec![None, None, NOP_STEPPER], &config, l).await,
             StateRole::Leader,
             1,
         ),
         (
-            Network::new_with_config(vec![None, NOP_STEPPER, NOP_STEPPER], &config, l),
+            Network::new_with_config(vec![None, NOP_STEPPER, NOP_STEPPER], &config, l).await,
             StateRole::Candidate,
             1,
         ),
         (
-            Network::new_with_config(vec![None, NOP_STEPPER, NOP_STEPPER, None], &config, l),
+            Network::new_with_config(vec![None, NOP_STEPPER, NOP_STEPPER, None], &config, l).await,
             StateRole::Candidate,
             1,
         ),
         (
-            Network::new_with_config(vec![None, NOP_STEPPER, NOP_STEPPER, None, None], &config, l),
+            Network::new_with_config(vec![None, NOP_STEPPER, NOP_STEPPER, None, None], &config, l)
+                .await,
             StateRole::Leader,
             1,
         ),
@@ -481,20 +491,15 @@ fn test_leader_election_with_config(pre_vote: bool, l: &Logger) {
             Network::new_with_config(
                 vec![
                     None,
-                    Some(ents_with_config(&[1], pre_vote, 2, vec![1, 2, 3, 4, 5], l)),
-                    Some(ents_with_config(&[1], pre_vote, 3, vec![1, 2, 3, 4, 5], l)),
-                    Some(ents_with_config(
-                        &[1, 1],
-                        pre_vote,
-                        4,
-                        vec![1, 2, 3, 4, 5],
-                        l,
-                    )),
+                    Some(ents_with_config(&[1], pre_vote, 2, vec![1, 2, 3, 4, 5], l).await),
+                    Some(ents_with_config(&[1], pre_vote, 3, vec![1, 2, 3, 4, 5], l).await),
+                    Some(ents_with_config(&[1, 1], pre_vote, 4, vec![1, 2, 3, 4, 5], l).await),
                     None,
                 ],
                 &config,
                 l,
-            ),
+            )
+            .await,
             StateRole::Follower,
             1,
         ),
@@ -505,7 +510,7 @@ fn test_leader_election_with_config(pre_vote: bool, l: &Logger) {
         m.from = 1;
         m.to = 1;
         m.set_msg_type(MessageType::MsgHup);
-        network.send(vec![m]);
+        network.send(vec![m]).await;
         let raft = &network.peers[&1];
         let (exp_state, exp_term) = if state == StateRole::Candidate && pre_vote {
             // In pre-vote mode, an election that fails to complete
@@ -524,33 +529,35 @@ fn test_leader_election_with_config(pre_vote: bool, l: &Logger) {
     }
 }
 
-#[test]
-fn test_leader_cycle() {
+#[tokio::test]
+async fn test_leader_cycle() {
     let l = default_logger();
-    test_leader_cycle_with_config(false, &l)
+    test_leader_cycle_with_config(false, &l).await
 }
 
-#[test]
-fn test_leader_cycle_pre_vote() {
+#[tokio::test]
+async fn test_leader_cycle_pre_vote() {
     let l = default_logger();
-    test_leader_cycle_with_config(true, &l)
+    test_leader_cycle_with_config(true, &l).await
 }
 
 // test_leader_cycle verifies that each node in a cluster can campaign
 // and be elected in turn. This ensures that elections (including
 // pre-vote) work when not starting from a clean state (as they do in
 // test_leader_election)
-fn test_leader_cycle_with_config(pre_vote: bool, l: &Logger) {
+async fn test_leader_cycle_with_config(pre_vote: bool, l: &Logger) {
     let mut config = Network::default_config();
     config.pre_vote = pre_vote;
-    let mut network = Network::new_with_config(vec![None, None, None], &config, l);
+    let mut network = Network::new_with_config(vec![None, None, None], &config, l).await;
     for campaigner_id in 1..4 {
-        network.send(vec![new_message(
-            campaigner_id,
-            campaigner_id,
-            MessageType::MsgHup,
-            0,
-        )]);
+        network
+            .send(vec![new_message(
+                campaigner_id,
+                campaigner_id,
+                MessageType::MsgHup,
+                0,
+            )])
+            .await;
 
         for sm in network.peers.values() {
             if sm.id == campaigner_id && sm.state != StateRole::Leader {
@@ -569,23 +576,23 @@ fn test_leader_cycle_with_config(pre_vote: bool, l: &Logger) {
     }
 }
 
-#[test]
-fn test_leader_election_overwrite_newer_logs() {
+#[tokio::test]
+async fn test_leader_election_overwrite_newer_logs() {
     let l = default_logger();
-    test_leader_election_overwrite_newer_logs_with_config(false, &l);
+    test_leader_election_overwrite_newer_logs_with_config(false, &l).await;
 }
 
-#[test]
-fn test_leader_election_overwrite_newer_logs_pre_vote() {
+#[tokio::test]
+async fn test_leader_election_overwrite_newer_logs_pre_vote() {
     let l = default_logger();
-    test_leader_election_overwrite_newer_logs_with_config(true, &l);
+    test_leader_election_overwrite_newer_logs_with_config(true, &l).await;
 }
 
 // test_leader_election_overwrite_newer_logs tests a scenario in which a
 // newly-elected leader does *not* have the newest (i.e. highest term)
 // log entries, and must overwrite higher-term log entries with
 // lower-term ones.
-fn test_leader_election_overwrite_newer_logs_with_config(pre_vote: bool, l: &Logger) {
+async fn test_leader_election_overwrite_newer_logs_with_config(pre_vote: bool, l: &Logger) {
     // This network represents the results of the following sequence of
     // events:
     // - Node 1 won the election in term 1.
@@ -605,32 +612,37 @@ fn test_leader_election_overwrite_newer_logs_with_config(pre_vote: bool, l: &Log
     config.pre_vote = pre_vote;
     let mut network = Network::new_with_config(
         vec![
-            Some(ents_with_config(&[1], pre_vote, 1, peers.clone(), l)), // Node 1: Won first election
-            Some(ents_with_config(&[1], pre_vote, 2, peers.clone(), l)), // Node 2: Get logs from node 1
-            Some(ents_with_config(&[2], pre_vote, 3, peers.clone(), l)), // Node 3: Won second election
-            Some(voted_with_config(3, 2, pre_vote, 4, peers.clone(), l)), // Node 4: Voted but didn't get logs
-            Some(voted_with_config(3, 2, pre_vote, 5, peers, l)), // Node 5: Voted but didn't get logs
+            Some(ents_with_config(&[1], pre_vote, 1, peers.clone(), l).await), // Node 1: Won first election
+            Some(ents_with_config(&[1], pre_vote, 2, peers.clone(), l).await), // Node 2: Get logs from node 1
+            Some(ents_with_config(&[2], pre_vote, 3, peers.clone(), l).await), // Node 3: Won second election
+            Some(voted_with_config(3, 2, pre_vote, 4, peers.clone(), l).await), // Node 4: Voted but didn't get logs
+            Some(voted_with_config(3, 2, pre_vote, 5, peers, l).await), // Node 5: Voted but didn't get logs
         ],
         &config,
         l,
-    );
+    )
+    .await;
 
     // Node 1 campaigns. The election fails because a quorum of nodes
     // know about the election that already happened at term 2. Node 1's
     // term is pushed ahead to 2.
-    network.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    network
+        .send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
     assert_eq!(network.peers[&1].state, StateRole::Follower);
     assert_eq!(network.peers[&1].term, 2);
 
     // Node 1 campaigns again with a higher term. this time it succeeds.
-    network.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    network
+        .send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
     assert_eq!(network.peers[&1].state, StateRole::Leader);
     assert_eq!(network.peers[&1].term, 3);
 
     // Now all nodes agree on a log entry with term 1 at index 1 (and
     // term 3 at index 2).
     for (id, sm) in &network.peers {
-        let entries = sm.raft_log.all_entries();
+        let entries = sm.raft_log.all_entries().await;
         assert_eq!(
             entries.len(),
             2,
@@ -651,19 +663,19 @@ fn test_leader_election_overwrite_newer_logs_with_config(pre_vote: bool, l: &Log
     }
 }
 
-#[test]
-fn test_vote_from_any_state() {
+#[tokio::test]
+async fn test_vote_from_any_state() {
     let l = default_logger();
-    test_vote_from_any_state_for_type(MessageType::MsgRequestVote, &l);
+    test_vote_from_any_state_for_type(MessageType::MsgRequestVote, &l).await;
 }
 
-#[test]
-fn test_prevote_from_any_state() {
+#[tokio::test]
+async fn test_prevote_from_any_state() {
     let l = default_logger();
-    test_vote_from_any_state_for_type(MessageType::MsgRequestPreVote, &l);
+    test_vote_from_any_state_for_type(MessageType::MsgRequestPreVote, &l).await;
 }
 
-fn test_vote_from_any_state_for_type(vt: MessageType, l: &Logger) {
+async fn test_vote_from_any_state_for_type(vt: MessageType, l: &Logger) {
     let all_states = vec![
         StateRole::Follower,
         StateRole::Candidate,
@@ -671,18 +683,18 @@ fn test_vote_from_any_state_for_type(vt: MessageType, l: &Logger) {
         StateRole::Leader,
     ];
     for state in all_states {
-        let mut r = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), l);
+        let mut r = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), l).await;
         r.term = 1;
         match state {
             StateRole::Follower => {
                 let term = r.term;
-                r.become_follower(term, 3);
+                r.become_follower(term, 3).await;
             }
             StateRole::PreCandidate => r.become_pre_candidate(),
-            StateRole::Candidate => r.become_candidate(),
+            StateRole::Candidate => r.become_candidate().await,
             StateRole::Leader => {
-                r.become_candidate();
-                r.become_leader();
+                r.become_candidate().await;
+                r.become_leader().await;
             }
         }
         // Note that setting our state above may have advanced r.term
@@ -695,6 +707,7 @@ fn test_vote_from_any_state_for_type(vt: MessageType, l: &Logger) {
         msg.log_term = new_term;
         msg.index = 42;
         r.step(msg)
+            .await
             .unwrap_or_else(|_| panic!("{:?},{:?}: step failed", vt, state));
         assert_eq!(
             r.msgs.len(),
@@ -760,17 +773,17 @@ fn test_vote_from_any_state_for_type(vt: MessageType, l: &Logger) {
     }
 }
 
-#[test]
-fn test_log_replication() {
+#[tokio::test]
+async fn test_log_replication() {
     let l = default_logger();
     let mut tests = vec![
         (
-            Network::new(vec![None, None, None], &l),
+            Network::new(vec![None, None, None], &l).await,
             vec![new_message(1, 1, MessageType::MsgPropose, 1)],
             2,
         ),
         (
-            Network::new(vec![None, None, None], &l),
+            Network::new(vec![None, None, None], &l).await,
             vec![
                 new_message(1, 1, MessageType::MsgPropose, 1),
                 new_message(1, 2, MessageType::MsgHup, 0),
@@ -781,9 +794,11 @@ fn test_log_replication() {
     ];
 
     for (i, &mut (ref mut network, ref msgs, wcommitted)) in tests.iter_mut().enumerate() {
-        network.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+        network
+            .send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+            .await;
         for m in msgs {
-            network.send(vec![m.clone()]);
+            network.send(vec![m.clone()]).await;
         }
 
         for (j, x) in &mut network.peers {
@@ -794,7 +809,7 @@ fn test_log_replication() {
                 );
             }
 
-            let mut ents = next_ents(x, &network.storage[j]);
+            let mut ents = next_ents(x, &network.storage[j]).await;
             let ents: Vec<Entry> = ents.drain(..).filter(|e| !e.data.is_empty()).collect();
             for (k, m) in msgs
                 .iter()
@@ -812,32 +827,38 @@ fn test_log_replication() {
     }
 }
 
-#[test]
-fn test_single_node_commit() {
+#[tokio::test]
+async fn test_single_node_commit() {
     let l = default_logger();
-    let mut tt = Network::new(vec![None], &l);
-    tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
-    tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
-    tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
+    let mut tt = Network::new(vec![None], &l).await;
+    tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
+    tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
+    tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
     assert_eq!(tt.peers[&1].raft_log.committed, 3);
 }
 
 // test_cannot_commit_without_new_term_entry tests the entries cannot be committed
 // when leader changes, no new proposal comes in and ChangeTerm proposal is
 // filtered.
-#[test]
-fn test_cannot_commit_without_new_term_entry() {
+#[tokio::test]
+async fn test_cannot_commit_without_new_term_entry() {
     let l = default_logger();
-    let mut tt = Network::new(vec![None, None, None, None, None], &l);
-    tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut tt = Network::new(vec![None, None, None, None, None], &l).await;
+    tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     // 0 cannot reach 2, 3, 4
     tt.cut(1, 3);
     tt.cut(1, 4);
     tt.cut(1, 5);
 
-    tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
-    tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
+    tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
+    tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
 
     assert_eq!(tt.peers[&1].raft_log.committed, 1);
 
@@ -847,35 +868,41 @@ fn test_cannot_commit_without_new_term_entry() {
     tt.ignore(MessageType::MsgAppend);
 
     // elect 2 as the new leader with term 2
-    tt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)]);
+    tt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)])
+        .await;
 
     // no log entries from previous term should be committed
     assert_eq!(tt.peers[&2].raft_log.committed, 1);
 
     tt.recover();
     // send heartbeat; reset wait
-    tt.send(vec![new_message(2, 2, MessageType::MsgBeat, 0)]);
+    tt.send(vec![new_message(2, 2, MessageType::MsgBeat, 0)])
+        .await;
     // append an entry at current term
-    tt.send(vec![new_message(2, 2, MessageType::MsgPropose, 1)]);
+    tt.send(vec![new_message(2, 2, MessageType::MsgPropose, 1)])
+        .await;
     // expect the committed to be advanced
     assert_eq!(tt.peers[&2].raft_log.committed, 5);
 }
 
 // test_commit_without_new_term_entry tests the entries could be committed
 // when leader changes, no new proposal comes in.
-#[test]
-fn test_commit_without_new_term_entry() {
+#[tokio::test]
+async fn test_commit_without_new_term_entry() {
     let l = default_logger();
-    let mut tt = Network::new(vec![None, None, None, None, None], &l);
-    tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut tt = Network::new(vec![None, None, None, None, None], &l).await;
+    tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     // 0 cannot reach 2, 3, 4
     tt.cut(1, 3);
     tt.cut(1, 4);
     tt.cut(1, 5);
 
-    tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
-    tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
+    tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
+    tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
 
     assert_eq!(tt.peers[&1].raft_log.committed, 1);
 
@@ -885,23 +912,26 @@ fn test_commit_without_new_term_entry() {
     // elect 1 as the new leader with term 2
     // after append a ChangeTerm entry from the current term, all entries
     // should be committed
-    tt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)]);
+    tt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)])
+        .await;
 
     assert_eq!(tt.peers[&1].raft_log.committed, 4);
 }
 
-#[test]
-fn test_dueling_candidates() {
+#[tokio::test]
+async fn test_dueling_candidates() {
     let l = default_logger();
-    let a = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l);
-    let b = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l);
-    let c = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l);
+    let a = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+    let b = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+    let c = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
 
-    let mut nt = Network::new(vec![Some(a), Some(b), Some(c)], &l);
+    let mut nt = Network::new(vec![Some(a), Some(b), Some(c)], &l).await;
     nt.cut(1, 3);
 
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
 
     // 1 becomes leader since it receives votes from 1 and 2
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
@@ -915,7 +945,8 @@ fn test_dueling_candidates() {
     // disrupt the leader 1 since it has a higher term, 3 will be follower again
     // since both 1 and 2 rejects its vote request since 3 does not have a long
     // enough log.
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
 
     let tests = vec![
         // role, term, committed, applied, last index.
@@ -937,24 +968,26 @@ fn test_dueling_candidates() {
         }
 
         let prefix = format!("#{}: ", i);
-        assert_raft_log(&prefix, &nt.peers[&id].raft_log, raft_log);
+        assert_raft_log(&prefix, &nt.peers[&id].raft_log, raft_log).await;
     }
 }
 
-#[test]
-fn test_dueling_pre_candidates() {
+#[tokio::test]
+async fn test_dueling_pre_candidates() {
     let l = default_logger();
-    let a = new_test_raft_with_prevote(1, vec![1, 2, 3], 10, 1, new_storage(), true, &l);
-    let b = new_test_raft_with_prevote(2, vec![1, 2, 3], 10, 1, new_storage(), true, &l);
-    let c = new_test_raft_with_prevote(3, vec![1, 2, 3], 10, 1, new_storage(), true, &l);
+    let a = new_test_raft_with_prevote(1, vec![1, 2, 3], 10, 1, new_storage(), true, &l).await;
+    let b = new_test_raft_with_prevote(2, vec![1, 2, 3], 10, 1, new_storage(), true, &l).await;
+    let c = new_test_raft_with_prevote(3, vec![1, 2, 3], 10, 1, new_storage(), true, &l).await;
 
     let mut config = Network::default_config();
     config.pre_vote = true;
-    let mut nt = Network::new_with_config(vec![Some(a), Some(b), Some(c)], &config, &l);
+    let mut nt = Network::new_with_config(vec![Some(a), Some(b), Some(c)], &config, &l).await;
     nt.cut(1, 3);
 
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
 
     // 1 becomes leader since it receives votes from 1 and 2
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
@@ -966,7 +999,8 @@ fn test_dueling_pre_candidates() {
 
     // Candidate 3 now increases its term and tries to vote again.
     // With pre-vote, it does not disrupt the leader.
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
 
     let tests = vec![
         // role, term, committed, applied, last index.
@@ -985,31 +1019,35 @@ fn test_dueling_pre_candidates() {
             panic!("#{}: term = {}, want {}", i, nt.peers[&id].term, term);
         }
         let prefix = format!("#{}: ", i);
-        assert_raft_log(&prefix, &nt.peers[&id].raft_log, raft_log);
+        assert_raft_log(&prefix, &nt.peers[&id].raft_log, raft_log).await;
     }
 }
 
-#[test]
-fn test_candidate_concede() {
+#[tokio::test]
+async fn test_candidate_concede() {
     let l = default_logger();
-    let mut tt = Network::new(vec![None, None, None], &l);
+    let mut tt = Network::new(vec![None, None, None], &l).await;
     tt.isolate(1);
 
-    tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
-    tt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+    tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
+    tt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
 
     // heal the partition
     tt.recover();
     // send heartbeat; reset wait
-    tt.send(vec![new_message(3, 3, MessageType::MsgBeat, 0)]);
+    tt.send(vec![new_message(3, 3, MessageType::MsgBeat, 0)])
+        .await;
 
     // send a proposal to 3 to flush out a MsgAppend to 1
     let data = "force follower";
     let mut m = new_message(3, 3, MessageType::MsgPropose, 0);
     m.entries = vec![new_entry(0, 0, Some(data))];
-    tt.send(vec![m]);
+    tt.send(vec![m]).await;
     // send heartbeat; flush out commit
-    tt.send(vec![new_message(3, 3, MessageType::MsgBeat, 0)]);
+    tt.send(vec![new_message(3, 3, MessageType::MsgBeat, 0)])
+        .await;
 
     assert_eq!(tt.peers[&1].state, StateRole::Follower);
     assert_eq!(tt.peers[&1].term, 1);
@@ -1017,85 +1055,98 @@ fn test_candidate_concede() {
     for p in tt.peers.values() {
         assert_eq!(p.raft_log.committed, 2); // All raft logs are committed.
         assert_eq!(p.raft_log.applied, 0); // Raft logs are based on a snapshot with index 1.
-        assert_eq!(p.raft_log.last_index(), 2);
+        assert_eq!(p.raft_log.last_index().await, 2);
     }
 }
 
-#[test]
-fn test_single_node_candidate() {
+#[tokio::test]
+async fn test_single_node_candidate() {
     let l = default_logger();
-    let mut tt = Network::new(vec![None], &l);
-    tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut tt = Network::new(vec![None], &l).await;
+    tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     assert_eq!(tt.peers[&1].state, StateRole::Leader);
 }
 
-#[test]
-fn test_sinle_node_pre_candidate() {
+#[tokio::test]
+async fn test_sinle_node_pre_candidate() {
     let l = default_logger();
     let mut config = Network::default_config();
     config.pre_vote = true;
-    let mut tt = Network::new_with_config(vec![None], &config, &l);
-    tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut tt = Network::new_with_config(vec![None], &config, &l).await;
+    tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     assert_eq!(tt.peers[&1].state, StateRole::Leader);
 }
 
-#[test]
-fn test_old_messages() {
+#[tokio::test]
+async fn test_old_messages() {
     let l = default_logger();
-    let mut tt = Network::new(vec![None, None, None], &l);
+    let mut tt = Network::new(vec![None, None, None], &l).await;
     // make 0 leader @ term 3
-    tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
-    tt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)]);
-    tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
+    tt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)])
+        .await;
+    tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
     // pretend we're an old leader trying to make progress; this entry is expected to be ignored.
     let mut m = new_message(2, 1, MessageType::MsgAppend, 0);
     m.term = 2;
     m.entries = vec![empty_entry(2, 3)];
-    tt.send(vec![m]);
+    tt.send(vec![m]).await;
     // commit a new entry
-    tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
+    tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
 
     for p in tt.peers.values() {
         let raft = p.raft.as_ref().unwrap();
         assert_eq!(raft.raft_log.committed, 4);
         assert_eq!(raft.raft_log.applied, 0);
-        assert_eq!(raft.raft_log.last_index(), 4);
+        assert_eq!(raft.raft_log.last_index().await, 4);
     }
 }
 
 // test_old_messages_reply - optimization - reply with new term.
 
-#[test]
-fn test_proposal() {
+async fn send_test_proposal(nw: &mut Network, m: Message, success: bool) {
+    let res = panic::AssertUnwindSafe(nw.send(vec![m]))
+        .catch_unwind()
+        .await;
+    assert!(res.is_ok() || !success);
+}
+
+#[tokio::test]
+async fn test_proposal() {
     let l = default_logger();
     let mut tests = vec![
-        (Network::new(vec![None, None, None], &l), true),
-        (Network::new(vec![None, None, NOP_STEPPER], &l), true),
+        (Network::new(vec![None, None, None], &l).await, true),
+        (Network::new(vec![None, None, NOP_STEPPER], &l).await, true),
         (
-            Network::new(vec![None, NOP_STEPPER, NOP_STEPPER], &l),
+            Network::new(vec![None, NOP_STEPPER, NOP_STEPPER], &l).await,
             false,
         ),
         (
-            Network::new(vec![None, NOP_STEPPER, NOP_STEPPER, None], &l),
+            Network::new(vec![None, NOP_STEPPER, NOP_STEPPER, None], &l).await,
             false,
         ),
         (
-            Network::new(vec![None, NOP_STEPPER, NOP_STEPPER, None, None], &l),
+            Network::new(vec![None, NOP_STEPPER, NOP_STEPPER, None, None], &l).await,
             true,
         ),
     ];
 
     for (j, (mut nw, success)) in tests.drain(..).enumerate() {
-        let send = |nw: &mut Network, m| {
-            let res = panic::catch_unwind(AssertUnwindSafe(|| nw.send(vec![m])));
-            assert!(res.is_ok() || !success);
-        };
-
         // promote 0 the leader
-        send(&mut nw, new_message(1, 1, MessageType::MsgHup, 0));
-        send(&mut nw, new_message(1, 1, MessageType::MsgPropose, 1));
+        send_test_proposal(&mut nw, new_message(1, 1, MessageType::MsgHup, 0), success).await;
+        send_test_proposal(
+            &mut nw,
+            new_message(1, 1, MessageType::MsgPropose, 1),
+            success,
+        )
+        .await;
 
         // committed index, applied index and last index.
         let want_log = if success { (2, 0, 2) } else { (0, 0, 0) };
@@ -1103,7 +1154,7 @@ fn test_proposal() {
         for p in nw.peers.values() {
             if let Some(ref raft) = p.raft {
                 let prefix = format!("#{}: ", j);
-                assert_raft_log(&prefix, &raft.raft_log, want_log);
+                assert_raft_log(&prefix, &raft.raft_log, want_log).await;
             }
         }
         if nw.peers[&1].term != 1 {
@@ -1112,19 +1163,21 @@ fn test_proposal() {
     }
 }
 
-#[test]
-fn test_proposal_by_proxy() {
+#[tokio::test]
+async fn test_proposal_by_proxy() {
     let l = default_logger();
     let mut tests = vec![
-        Network::new(vec![None, None, None], &l),
-        Network::new(vec![None, None, NOP_STEPPER], &l),
+        Network::new(vec![None, None, None], &l).await,
+        Network::new(vec![None, None, NOP_STEPPER], &l).await,
     ];
     for (j, tt) in tests.iter_mut().enumerate() {
         // promote 0 the leader
-        tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+        tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+            .await;
 
         // propose via follower
-        tt.send(vec![new_message(2, 2, MessageType::MsgPropose, 1)]);
+        tt.send(vec![new_message(2, 2, MessageType::MsgPropose, 1)])
+            .await;
 
         for p in tt.peers.values() {
             if p.raft.is_none() {
@@ -1132,7 +1185,7 @@ fn test_proposal_by_proxy() {
             }
             if let Some(ref raft) = p.raft {
                 let prefix = format!("#{}: ", j);
-                assert_raft_log(&prefix, &raft.raft_log, (2, 0, 2));
+                assert_raft_log(&prefix, &raft.raft_log, (2, 0, 2)).await;
             }
         }
         if tt.peers[&1].term != 1 {
@@ -1141,8 +1194,8 @@ fn test_proposal_by_proxy() {
     }
 }
 
-#[test]
-fn test_commit() {
+#[tokio::test]
+async fn test_commit() {
     let l = default_logger();
     let mut tests = vec![
         // single
@@ -1215,32 +1268,32 @@ fn test_commit() {
     ];
 
     for (i, (matches, logs, sm_term, w)) in tests.drain(..).enumerate() {
-        let store = MemStorage::new_with_conf_state((vec![1], vec![]));
+        let store = MemStorage::new_with_conf_state((vec![1], vec![])).await;
         store.wl().append(&logs).unwrap();
         let mut hs = HardState::default();
         hs.term = sm_term;
         store.wl().set_hardstate(hs);
         let cfg = new_test_config(1, 5, 1);
-        let mut sm = new_test_raft_with_config(&cfg, store, &l);
+        let mut sm = new_test_raft_with_config(&cfg, store, &l).await;
 
         for (j, v) in matches.iter().enumerate() {
             let id = j as u64 + 1;
             if sm.mut_prs().get(id).is_none() {
-                sm.apply_conf_change(&add_node(id)).unwrap();
+                sm.apply_conf_change(&add_node(id)).await.unwrap();
                 let pr = sm.mut_prs().get_mut(id).unwrap();
                 pr.matched = *v;
                 pr.next_idx = *v + 1;
             }
         }
-        sm.maybe_commit();
+        sm.maybe_commit().await;
         if sm.raft_log.committed != w {
             panic!("#{}: committed = {}, want {}", i, sm.raft_log.committed, w);
         }
     }
 }
 
-#[test]
-fn test_pass_election_timeout() {
+#[tokio::test]
+async fn test_pass_election_timeout() {
     let l = default_logger();
     let tests = vec![
         (5, 0f64, false),
@@ -1252,7 +1305,7 @@ fn test_pass_election_timeout() {
     ];
 
     for (i, &(elapse, wprobability, round)) in tests.iter().enumerate() {
-        let mut sm = new_test_raft(1, vec![1], 10, 1, new_storage(), &l);
+        let mut sm = new_test_raft(1, vec![1], 10, 1, new_storage(), &l).await;
         sm.election_elapsed = elapse;
         let mut c = 0;
         for _ in 0..10_000 {
@@ -1277,8 +1330,8 @@ fn test_pass_election_timeout() {
 //    delete the existing entry and all that follow it; append any new entries not already in the
 //    log.
 // 3. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
-#[test]
-fn test_handle_msg_append() {
+#[tokio::test]
+async fn test_handle_msg_append() {
     let l = default_logger();
     let nm = |term, log_term, index, commit, ents: Option<Vec<(u64, u64)>>| {
         let mut m = Message::default();
@@ -1319,15 +1372,16 @@ fn test_handle_msg_append() {
             MemStorage::new(),
             &[empty_entry(1, 1), empty_entry(2, 2)],
             &l,
-        );
+        )
+        .await;
 
-        sm.become_follower(2, INVALID_ID);
-        sm.handle_append_entries(&m);
-        if sm.raft_log.last_index() != w_index {
+        sm.become_follower(2, INVALID_ID).await;
+        sm.handle_append_entries(&m).await;
+        if sm.raft_log.last_index().await != w_index {
             panic!(
                 "#{}: last_index = {}, want {}",
                 j,
-                sm.raft_log.last_index(),
+                sm.raft_log.last_index().await,
                 w_index
             );
         }
@@ -1348,8 +1402,8 @@ fn test_handle_msg_append() {
 }
 
 // test_handle_heartbeat ensures that the follower commits to the commit in the message.
-#[test]
-fn test_handle_heartbeat() {
+#[tokio::test]
+async fn test_handle_heartbeat() {
     let l = default_logger();
     let commit = 2u64;
     let nw = |f, to, term, commit| {
@@ -1363,16 +1417,16 @@ fn test_handle_heartbeat() {
         (nw(2, 1, 2, commit - 1), commit), // do not decrease commit
     ];
     for (i, (m, w_commit)) in tests.drain(..).enumerate() {
-        let store = MemStorage::new_with_conf_state((vec![1, 2], vec![]));
+        let store = MemStorage::new_with_conf_state((vec![1, 2], vec![])).await;
         store
             .wl()
             .append(&[empty_entry(1, 1), empty_entry(2, 2), empty_entry(3, 3)])
             .unwrap();
         let cfg = new_test_config(1, 5, 1);
-        let mut sm = new_test_raft_with_config(&cfg, store, &l);
-        sm.become_follower(2, 2);
-        sm.raft_log.commit_to(commit);
-        sm.handle_heartbeat(m);
+        let mut sm = new_test_raft_with_config(&cfg, store, &l).await;
+        sm.become_follower(2, 2).await;
+        sm.raft_log.commit_to(commit).await;
+        sm.handle_heartbeat(m).await;
         if sm.raft_log.committed != w_commit {
             panic!(
                 "#{}: committed = {}, want = {}",
@@ -1394,22 +1448,23 @@ fn test_handle_heartbeat() {
 }
 
 // test_handle_heartbeat_resp ensures that we re-send log entries when we get a heartbeat response.
-#[test]
-fn test_handle_heartbeat_resp() {
+#[tokio::test]
+async fn test_handle_heartbeat_resp() {
     let l = default_logger();
     let store = new_storage();
     store
         .wl()
         .append(&[empty_entry(1, 1), empty_entry(2, 2), empty_entry(3, 3)])
         .unwrap();
-    let mut sm = new_test_raft(1, vec![1, 2], 5, 1, store, &l);
-    sm.become_candidate();
-    sm.become_leader();
-    let last_index = sm.raft_log.last_index();
-    sm.raft_log.commit_to(last_index);
+    let mut sm = new_test_raft(1, vec![1, 2], 5, 1, store, &l).await;
+    sm.become_candidate().await;
+    sm.become_leader().await;
+    let last_index = sm.raft_log.last_index().await;
+    sm.raft_log.commit_to(last_index).await;
 
     // A heartbeat response from a node that is behind; re-send MsgApp
     sm.step(new_message(2, 0, MessageType::MsgHeartbeatResponse, 0))
+        .await
         .expect("");
     let mut msgs = sm.read_messages();
     assert_eq!(msgs.len(), 1);
@@ -1417,6 +1472,7 @@ fn test_handle_heartbeat_resp() {
 
     // A second heartbeat response generates another MsgApp re-send
     sm.step(new_message(2, 0, MessageType::MsgHeartbeatResponse, 0))
+        .await
         .expect("");
     msgs = sm.read_messages();
     assert_eq!(msgs.len(), 1);
@@ -1425,11 +1481,12 @@ fn test_handle_heartbeat_resp() {
     // Once we have an MsgAppResp, heartbeats no longer send MsgApp.
     let mut m = new_message(2, 0, MessageType::MsgAppendResponse, 0);
     m.index = msgs[0].index + msgs[0].entries.len() as u64;
-    sm.step(m).expect("");
+    sm.step(m).await.expect("");
     // Consume the message sent in response to MsgAppResp
     sm.read_messages();
 
     sm.step(new_message(2, 0, MessageType::MsgHeartbeatResponse, 0))
+        .await
         .expect("");
     msgs = sm.read_messages();
     assert!(msgs.is_empty());
@@ -1438,14 +1495,14 @@ fn test_handle_heartbeat_resp() {
 // test_raft_frees_read_only_mem ensures raft will free read request from
 // ReadOnly read_index_queue and pending_read_index map.
 // related issue: https://github.com/coreos/etcd/issues/7571
-#[test]
-fn test_raft_frees_read_only_mem() {
+#[tokio::test]
+async fn test_raft_frees_read_only_mem() {
     let l = default_logger();
-    let mut sm = new_test_raft(1, vec![1, 2], 5, 1, new_storage(), &l);
-    sm.become_candidate();
-    sm.become_leader();
-    let last_index = sm.raft_log.last_index();
-    sm.raft_log.commit_to(last_index);
+    let mut sm = new_test_raft(1, vec![1, 2], 5, 1, new_storage(), &l).await;
+    sm.become_candidate().await;
+    sm.become_leader().await;
+    let last_index = sm.raft_log.last_index().await;
+    sm.raft_log.commit_to(last_index).await;
 
     let ctx = "ctx";
     let vec_ctx = ctx.as_bytes().to_vec();
@@ -1458,7 +1515,7 @@ fn test_raft_frees_read_only_mem() {
         MessageType::MsgReadIndex,
         vec![new_entry(0, 0, Some(ctx))],
     );
-    sm.step(m).expect("");
+    sm.step(m).await.expect("");
     let msgs = sm.read_messages();
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].msg_type(), MessageType::MsgHeartbeat);
@@ -1472,7 +1529,7 @@ fn test_raft_frees_read_only_mem() {
     // more info: raft dissertation 6.4, step 3.
     let mut m = new_message(2, 1, MessageType::MsgHeartbeatResponse, 0);
     m.context = vec_ctx.clone();
-    sm.step(m).expect("");
+    sm.step(m).await.expect("");
     assert_eq!(sm.read_only.read_index_queue.len(), 0);
     assert_eq!(sm.read_only.pending_read_index.len(), 0);
     assert!(!sm.read_only.pending_read_index.contains_key(&vec_ctx));
@@ -1480,23 +1537,23 @@ fn test_raft_frees_read_only_mem() {
 
 // test_msg_append_response_wait_reset verifies the waitReset behavior of a leader
 // MsgAppResp.
-#[test]
-fn test_msg_append_response_wait_reset() {
+#[tokio::test]
+async fn test_msg_append_response_wait_reset() {
     let l = default_logger();
-    let mut sm = new_test_raft(1, vec![1, 2, 3], 5, 1, new_storage(), &l);
-    sm.become_candidate();
-    sm.become_leader();
+    let mut sm = new_test_raft(1, vec![1, 2, 3], 5, 1, new_storage(), &l).await;
+    sm.become_candidate().await;
+    sm.become_leader().await;
     // For no-op entry
-    sm.persist();
+    sm.persist().await;
     // The new leader has just emitted a new Term 4 entry; consume those messages
     // from the outgoing queue.
-    sm.bcast_append();
+    sm.bcast_append().await;
     sm.read_messages();
 
     // Node 2 acks the first entry, making it committed.
     let mut m = new_message(2, 0, MessageType::MsgAppendResponse, 0);
     m.index = 1;
-    sm.step(m).expect("");
+    sm.step(m).await.expect("");
     assert_eq!(sm.raft_log.committed, 1);
     // Also consume the MsgApp messages that update Commit on the followers.
     sm.read_messages();
@@ -1504,8 +1561,8 @@ fn test_msg_append_response_wait_reset() {
     // A new command is now proposed on node 1.
     m = new_message(1, 0, MessageType::MsgPropose, 0);
     m.entries = vec![empty_entry(0, 0)];
-    sm.step(m).expect("");
-    sm.persist();
+    sm.step(m).await.expect("");
+    sm.persist().await;
 
     // The command is broadcast to all nodes not in the wait state.
     // Node 2 left the wait state due to its MsgAppResp, but node 3 is still waiting.
@@ -1519,7 +1576,7 @@ fn test_msg_append_response_wait_reset() {
     // Now Node 3 acks the first entry. This releases the wait and entry 2 is sent.
     m = new_message(3, 0, MessageType::MsgAppendResponse, 0);
     m.index = 1;
-    sm.step(m).expect("");
+    sm.step(m).await.expect("");
     msgs = sm.read_messages();
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].msg_type(), MessageType::MsgAppend);
@@ -1528,13 +1585,13 @@ fn test_msg_append_response_wait_reset() {
     assert_eq!(msgs[0].entries[0].index, 2);
 }
 
-#[test]
-fn test_recv_msg_request_vote() {
+#[tokio::test]
+async fn test_recv_msg_request_vote() {
     let l = default_logger();
-    test_recv_msg_request_vote_for_type(MessageType::MsgRequestVote, &l);
+    test_recv_msg_request_vote_for_type(MessageType::MsgRequestVote, &l).await;
 }
 
-fn test_recv_msg_request_vote_for_type(msg_type: MessageType, l: &Logger) {
+async fn test_recv_msg_request_vote_for_type(msg_type: MessageType, l: &Logger) {
     let mut tests = vec![
         (StateRole::Follower, 0, 0, INVALID_ID, true),
         (StateRole::Follower, 0, 1, INVALID_ID, true),
@@ -1560,10 +1617,10 @@ fn test_recv_msg_request_vote_for_type(msg_type: MessageType, l: &Logger) {
     ];
 
     for (j, (state, index, log_term, vote_for, w_reject)) in tests.drain(..).enumerate() {
-        let store = MemStorage::new_with_conf_state((vec![1], vec![]));
+        let store = MemStorage::new_with_conf_state((vec![1], vec![])).await;
         let ents = &[empty_entry(2, 1), empty_entry(2, 2)];
         store.wl().append(ents).unwrap();
-        let mut sm = new_test_raft(1, vec![1], 10, 1, store, l);
+        let mut sm = new_test_raft(1, vec![1], 10, 1, store, l).await;
         sm.state = state;
         sm.vote = vote_for;
 
@@ -1578,10 +1635,10 @@ fn test_recv_msg_request_vote_for_type(msg_type: MessageType, l: &Logger) {
         // what the recipient node does when receiving a message with a
         // different term number, so we simply initialize both term numbers to
         // be the same.
-        let term = cmp::max(sm.raft_log.last_term(), log_term);
+        let term = cmp::max(sm.raft_log.last_term().await, log_term);
         m.term = term;
         sm.term = term;
-        sm.step(m).expect("");
+        sm.step(m).await.expect("");
 
         let msgs = sm.read_messages();
         if msgs.len() != 1 {
@@ -1604,8 +1661,8 @@ fn test_recv_msg_request_vote_for_type(msg_type: MessageType, l: &Logger) {
     }
 }
 
-#[test]
-fn test_state_transition() {
+#[tokio::test]
+async fn test_state_transition() {
     let l = default_logger();
     let mut tests = vec![
         (
@@ -1692,15 +1749,20 @@ fn test_state_transition() {
         (StateRole::Leader, StateRole::Leader, true, 0, 1),
     ];
     for (i, (from, to, wallow, wterm, wlead)) in tests.drain(..).enumerate() {
-        let sm: &mut Raft<MemStorage> = &mut new_test_raft(1, vec![1], 10, 1, new_storage(), &l);
+        let mut interface = new_test_raft(1, vec![1], 10, 1, new_storage(), &l).await;
+        let sm: &mut Raft<MemStorage> = &mut interface;
         sm.state = from;
 
-        let res = panic::catch_unwind(AssertUnwindSafe(|| match to {
-            StateRole::Follower => sm.become_follower(wterm, wlead),
-            StateRole::PreCandidate => sm.become_pre_candidate(),
-            StateRole::Candidate => sm.become_candidate(),
-            StateRole::Leader => sm.become_leader(),
-        }));
+        let res = std::panic::AssertUnwindSafe(async {
+            match to {
+                StateRole::Follower => sm.become_follower(wterm, wlead).await,
+                StateRole::PreCandidate => sm.become_pre_candidate(),
+                StateRole::Candidate => sm.become_candidate().await,
+                StateRole::Leader => sm.become_leader().await,
+            }
+        })
+        .catch_unwind()
+        .await;
         if res.is_ok() ^ wallow {
             panic!("#{}: allow = {}, want {}", i, res.is_ok(), wallow);
         }
@@ -1717,8 +1779,8 @@ fn test_state_transition() {
     }
 }
 
-#[test]
-fn test_all_server_stepdown() {
+#[tokio::test]
+async fn test_all_server_stepdown() {
     let l = default_logger();
     let mut tests = vec![
         // state, want_state, term, last_index, entry count.
@@ -1732,14 +1794,14 @@ fn test_all_server_stepdown() {
     let tterm = 3u64;
 
     for (i, (state, wstate, wterm, windex, entries)) in tests.drain(..).enumerate() {
-        let mut sm = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l);
+        let mut sm = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
         match state {
-            StateRole::Follower => sm.become_follower(1, INVALID_ID),
+            StateRole::Follower => sm.become_follower(1, INVALID_ID).await,
             StateRole::PreCandidate => sm.become_pre_candidate(),
-            StateRole::Candidate => sm.become_candidate(),
+            StateRole::Candidate => sm.become_candidate().await,
             StateRole::Leader => {
-                sm.become_candidate();
-                sm.become_leader();
+                sm.become_candidate().await;
+                sm.become_leader().await;
             }
         }
 
@@ -1747,7 +1809,7 @@ fn test_all_server_stepdown() {
             let mut m = new_message(2, 0, msg_type, 0);
             m.term = tterm;
             m.log_term = tterm;
-            sm.step(m).expect("");
+            sm.step(m).await.expect("");
 
             if sm.state != wstate {
                 panic!("{}.{} state = {:?}, want {:?}", i, j, sm.state, wstate);
@@ -1755,16 +1817,16 @@ fn test_all_server_stepdown() {
             if sm.term != wterm {
                 panic!("{}.{} term = {}, want {}", i, j, sm.term, wterm);
             }
-            if sm.raft_log.last_index() != windex {
+            if sm.raft_log.last_index().await != windex {
                 panic!(
                     "{}.{} index = {}, want {}",
                     i,
                     j,
-                    sm.raft_log.last_index(),
+                    sm.raft_log.last_index().await,
                     windex
                 );
             }
-            let entry_count = sm.raft_log.all_entries().len() as u64;
+            let entry_count = sm.raft_log.all_entries().await.len() as u64;
             if entry_count != entries {
                 panic!("{}.{} ents count = {}, want {}", i, j, entry_count, entries);
             }
@@ -1780,29 +1842,30 @@ fn test_all_server_stepdown() {
     }
 }
 
-#[test]
-fn test_candidate_reset_term_msg_heartbeat() {
+#[tokio::test]
+async fn test_candidate_reset_term_msg_heartbeat() {
     let l = default_logger();
-    test_candidate_reset_term(MessageType::MsgHeartbeat, &l)
+    test_candidate_reset_term(MessageType::MsgHeartbeat, &l).await
 }
 
-#[test]
-fn test_candidate_reset_term_msg_append() {
+#[tokio::test]
+async fn test_candidate_reset_term_msg_append() {
     let l = default_logger();
-    test_candidate_reset_term(MessageType::MsgAppend, &l)
+    test_candidate_reset_term(MessageType::MsgAppend, &l).await
 }
 
 // test_candidate_reset_term tests when a candidate receives a
 // MsgHeartbeat or MsgAppend from leader, "step" resets the term
 // with leader's and reverts back to follower.
-fn test_candidate_reset_term(message_type: MessageType, l: &Logger) {
-    let a = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), l);
-    let b = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), l);
-    let c = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), l);
+async fn test_candidate_reset_term(message_type: MessageType, l: &Logger) {
+    let a = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), l).await;
+    let b = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), l).await;
+    let c = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), l).await;
 
-    let mut nt = Network::new(vec![Some(a), Some(b), Some(c)], l);
+    let mut nt = Network::new(vec![Some(a), Some(b), Some(c)], l).await;
 
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
     assert_eq!(nt.peers[&2].state, StateRole::Follower);
@@ -1810,8 +1873,10 @@ fn test_candidate_reset_term(message_type: MessageType, l: &Logger) {
 
     // isolate 3 and increase term in rest
     nt.isolate(3);
-    nt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)]);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)])
+        .await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
     assert_eq!(nt.peers[&2].state, StateRole::Follower);
@@ -1824,7 +1889,7 @@ fn test_candidate_reset_term(message_type: MessageType, l: &Logger) {
         .reset_randomized_election_timeout();
     let timeout = nt.peers[&3].randomized_election_timeout();
     for _ in 0..timeout {
-        nt.peers.get_mut(&3).unwrap().tick();
+        nt.peers.get_mut(&3).unwrap().tick().await;
     }
 
     assert_eq!(nt.peers[&3].state, StateRole::Candidate);
@@ -1835,7 +1900,7 @@ fn test_candidate_reset_term(message_type: MessageType, l: &Logger) {
     // and expects candidate to revert to follower
     let mut msg = new_message(1, 3, message_type, 0);
     msg.term = nt.peers[&1].term;
-    nt.send(vec![msg]);
+    nt.send(vec![msg]).await;
 
     assert_eq!(nt.peers[&3].state, StateRole::Follower);
 
@@ -1847,53 +1912,53 @@ fn test_candidate_reset_term(message_type: MessageType, l: &Logger) {
     )
 }
 
-#[test]
-fn test_leader_stepdown_when_quorum_active() {
+#[tokio::test]
+async fn test_leader_stepdown_when_quorum_active() {
     let l = default_logger();
-    let mut sm = new_test_raft(1, vec![1, 2, 3], 5, 1, new_storage(), &l);
+    let mut sm = new_test_raft(1, vec![1, 2, 3], 5, 1, new_storage(), &l).await;
     sm.check_quorum = true;
-    sm.become_candidate();
-    sm.become_leader();
+    sm.become_candidate().await;
+    sm.become_leader().await;
 
     for _ in 0..=sm.election_timeout() {
         let mut m = new_message(2, 0, MessageType::MsgHeartbeatResponse, 0);
         m.term = sm.term;
-        sm.step(m).expect("");
-        sm.tick();
+        sm.step(m).await.expect("");
+        sm.tick().await;
     }
 
     assert_eq!(sm.state, StateRole::Leader);
 }
 
-#[test]
-fn test_leader_stepdown_when_quorum_lost() {
+#[tokio::test]
+async fn test_leader_stepdown_when_quorum_lost() {
     let l = default_logger();
-    let mut sm = new_test_raft(1, vec![1, 2, 3], 5, 1, new_storage(), &l);
+    let mut sm = new_test_raft(1, vec![1, 2, 3], 5, 1, new_storage(), &l).await;
 
     sm.check_quorum = true;
 
-    sm.become_candidate();
-    sm.become_leader();
+    sm.become_candidate().await;
+    sm.become_leader().await;
 
     for _ in 0..=sm.election_timeout() {
-        sm.tick();
+        sm.tick().await;
     }
 
     assert_eq!(sm.state, StateRole::Follower);
 }
 
-#[test]
-fn test_leader_superseding_with_check_quorum() {
+#[tokio::test]
+async fn test_leader_superseding_with_check_quorum() {
     let l = default_logger();
-    let mut a = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l);
-    let mut b = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l);
-    let mut c = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l);
+    let mut a = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+    let mut b = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+    let mut c = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
 
     a.check_quorum = true;
     b.check_quorum = true;
     c.check_quorum = true;
 
-    let mut nt = Network::new(vec![Some(a), Some(b), Some(c)], &l);
+    let mut nt = Network::new(vec![Some(a), Some(b), Some(c)], &l).await;
 
     let b_election_timeout = nt.peers[&2].election_timeout();
 
@@ -1903,38 +1968,41 @@ fn test_leader_superseding_with_check_quorum() {
         .unwrap()
         .set_randomized_election_timeout(b_election_timeout + 1);
     for _ in 0..b_election_timeout {
-        nt.peers.get_mut(&2).unwrap().tick();
+        nt.peers.get_mut(&2).unwrap().tick().await;
     }
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
     assert_eq!(nt.peers[&3].state, StateRole::Follower);
 
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
 
     // Peer b rejected c's vote since its electionElapsed had not reached to electionTimeout
     assert_eq!(nt.peers[&3].state, StateRole::Candidate);
 
     // Letting b's electionElapsed reach to electionTimeout
     for _ in 0..b_election_timeout {
-        nt.peers.get_mut(&2).unwrap().tick();
+        nt.peers.get_mut(&2).unwrap().tick().await;
     }
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
     assert_eq!(nt.peers[&3].state, StateRole::Leader);
 }
 
-#[test]
-fn test_leader_election_with_check_quorum() {
+#[tokio::test]
+async fn test_leader_election_with_check_quorum() {
     let l = default_logger();
-    let mut a = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l);
-    let mut b = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l);
-    let mut c = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l);
+    let mut a = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+    let mut b = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+    let mut c = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
 
     a.check_quorum = true;
     b.check_quorum = true;
     c.check_quorum = true;
 
-    let mut nt = Network::new(vec![Some(a), Some(b), Some(c)], &l);
+    let mut nt = Network::new(vec![Some(a), Some(b), Some(c)], &l).await;
 
     // we can not let system choosing the value of randomizedElectionTimeout
     // otherwise it will introduce some uncertainty into this test case
@@ -1952,7 +2020,8 @@ fn test_leader_election_with_check_quorum() {
 
     // Immediately after creation, votes are cast regardless of the election timeout
 
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
     assert_eq!(nt.peers[&3].state, StateRole::Follower);
@@ -1971,12 +2040,13 @@ fn test_leader_election_with_check_quorum() {
         .set_randomized_election_timeout(b_election_timeout + 2);
 
     for _ in 0..a_election_timeout {
-        nt.peers.get_mut(&1).unwrap().tick();
+        nt.peers.get_mut(&1).unwrap().tick().await;
     }
     for _ in 0..b_election_timeout {
-        nt.peers.get_mut(&2).unwrap().tick();
+        nt.peers.get_mut(&2).unwrap().tick().await;
     }
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
 
     assert_eq!(nt.peers[&1].state, StateRole::Follower);
     assert_eq!(nt.peers[&3].state, StateRole::Leader);
@@ -1985,18 +2055,18 @@ fn test_leader_election_with_check_quorum() {
 // test_free_stuck_candidate_with_check_quorum ensures that a candidate with a higher term
 // can disrupt the leader even if the leader still "officially" holds the lease, The
 // leader is expected to step down and adopt the candidate's term
-#[test]
-fn test_free_stuck_candidate_with_check_quorum() {
+#[tokio::test]
+async fn test_free_stuck_candidate_with_check_quorum() {
     let l = default_logger();
-    let mut a = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l);
-    let mut b = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l);
-    let mut c = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l);
+    let mut a = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+    let mut b = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+    let mut c = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
 
     a.check_quorum = true;
     b.check_quorum = true;
     c.check_quorum = true;
 
-    let mut nt = Network::new(vec![Some(a), Some(b), Some(c)], &l);
+    let mut nt = Network::new(vec![Some(a), Some(b), Some(c)], &l).await;
 
     // we can not let system choosing the value of randomizedElectionTimeout
     // otherwise it will introduce some uncertainty into this test case
@@ -2008,18 +2078,21 @@ fn test_free_stuck_candidate_with_check_quorum() {
         .set_randomized_election_timeout(b_election_timeout + 1);
 
     for _ in 0..b_election_timeout {
-        nt.peers.get_mut(&2).unwrap().tick();
+        nt.peers.get_mut(&2).unwrap().tick().await;
     }
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
     nt.isolate(1);
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
 
     assert_eq!(nt.peers[&2].state, StateRole::Follower);
     assert_eq!(nt.peers[&3].state, StateRole::Candidate);
     assert_eq!(nt.peers[&3].term, &nt.peers[&2].term + 1);
 
     // Vote again for safety
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
 
     assert_eq!(nt.peers[&2].state, StateRole::Follower);
     assert_eq!(nt.peers[&3].state, StateRole::Candidate);
@@ -2028,27 +2101,28 @@ fn test_free_stuck_candidate_with_check_quorum() {
     nt.recover();
     let mut msg = new_message(1, 3, MessageType::MsgHeartbeat, 0);
     msg.term = nt.peers[&1].term;
-    nt.send(vec![msg]);
+    nt.send(vec![msg]).await;
 
     // Disrupt the leader so that the stuck peer is freed
     assert_eq!(nt.peers[&1].state, StateRole::Follower);
     assert_eq!(nt.peers[&3].term, nt.peers[&1].term);
 
     // Vote again, should become leader this time
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
     assert_eq!(nt.peers[&3].state, StateRole::Leader);
 }
 
-#[test]
-fn test_non_promotable_voter_with_check_quorum() {
+#[tokio::test]
+async fn test_non_promotable_voter_with_check_quorum() {
     let l = default_logger();
-    let mut a = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l);
-    let mut b = new_test_raft(2, vec![1], 10, 1, new_storage(), &l);
+    let mut a = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l).await;
+    let mut b = new_test_raft(2, vec![1], 10, 1, new_storage(), &l).await;
 
     a.check_quorum = true;
     b.check_quorum = true;
 
-    let mut nt = Network::new(vec![Some(a), Some(b)], &l);
+    let mut nt = Network::new(vec![Some(a), Some(b)], &l).await;
 
     // we can not let system choosing the value of randomizedElectionTimeout
     // otherwise it will introduce some uncertainty into this test case
@@ -2065,14 +2139,16 @@ fn test_non_promotable_voter_with_check_quorum() {
         .get_mut(&2)
         .unwrap()
         .apply_conf_change(&remove_node(2))
+        .await
         .unwrap();
 
     assert!(!nt.peers[&2].promotable());
 
     for _ in 0..b_election_timeout {
-        nt.peers.get_mut(&2).unwrap().tick();
+        nt.peers.get_mut(&2).unwrap().tick().await;
     }
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
     assert_eq!(nt.peers[&2].state, StateRole::Follower);
@@ -2084,23 +2160,24 @@ fn test_non_promotable_voter_with_check_quorum() {
 /// to become a candidate with an increased term. Then, the
 /// candiate's response to late leader heartbeat forces the leader
 /// to step down.
-#[test]
-fn test_disruptive_follower() {
+#[tokio::test]
+async fn test_disruptive_follower() {
     let l = default_logger();
-    let mut n1 = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l);
-    let mut n2 = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l);
-    let mut n3 = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l);
+    let mut n1 = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+    let mut n2 = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+    let mut n3 = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
 
     n1.check_quorum = true;
     n2.check_quorum = true;
     n3.check_quorum = true;
 
-    n1.become_follower(1, INVALID_ID);
-    n2.become_follower(1, INVALID_ID);
-    n3.become_follower(1, INVALID_ID);
+    n1.become_follower(1, INVALID_ID).await;
+    n2.become_follower(1, INVALID_ID).await;
+    n3.become_follower(1, INVALID_ID).await;
 
-    let mut nt = Network::new(vec![Some(n1), Some(n2), Some(n3)], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![Some(n1), Some(n2), Some(n3)], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     // check state
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
@@ -2118,7 +2195,7 @@ fn test_disruptive_follower() {
         .set_randomized_election_timeout(timeout + 2);
     let timeout = nt.peers[&3].randomized_election_timeout();
     for _ in 0..timeout - 1 {
-        nt.peers.get_mut(&3).unwrap().tick();
+        nt.peers.get_mut(&3).unwrap().tick().await;
     }
 
     // ideally, before last election tick elapses,
@@ -2126,7 +2203,7 @@ fn test_disruptive_follower() {
     // from leader n1, and then resets its "electionElapsed"
     // however, last tick may elapse before receiving any
     // messages from leader, thus triggering campaign
-    nt.peers.get_mut(&3).unwrap().tick();
+    nt.peers.get_mut(&3).unwrap().tick().await;
 
     // n1 is still leader yet
     // while its heartbeat to candidate n3 is being delayed
@@ -2149,7 +2226,7 @@ fn test_disruptive_follower() {
     // heartbeat was sent with lower term than candidate's
     let mut msg = new_message(1, 3, MessageType::MsgHeartbeat, 0);
     msg.term = nt.peers[&1].term;
-    nt.send(vec![msg]);
+    nt.send(vec![msg]).await;
 
     // then candidate n3 responds with "pb.MsgAppResp" of higher term
     // and leader steps down from a message with higher term
@@ -2175,23 +2252,24 @@ fn test_disruptive_follower() {
 /// to become a pre-candidate with less log than current leader.
 /// Then pre-vote phase prevents this isolated node from forcing
 /// current leader to step down, thus less disruptions.
-#[test]
-fn test_disruptive_follower_pre_vote() {
+#[tokio::test]
+async fn test_disruptive_follower_pre_vote() {
     let l = default_logger();
-    let mut n1 = new_test_raft_with_prevote(1, vec![1, 2, 3], 10, 1, new_storage(), true, &l);
-    let mut n2 = new_test_raft_with_prevote(2, vec![1, 2, 3], 10, 1, new_storage(), true, &l);
-    let mut n3 = new_test_raft_with_prevote(3, vec![1, 2, 3], 10, 1, new_storage(), true, &l);
+    let mut n1 = new_test_raft_with_prevote(1, vec![1, 2, 3], 10, 1, new_storage(), true, &l).await;
+    let mut n2 = new_test_raft_with_prevote(2, vec![1, 2, 3], 10, 1, new_storage(), true, &l).await;
+    let mut n3 = new_test_raft_with_prevote(3, vec![1, 2, 3], 10, 1, new_storage(), true, &l).await;
 
     n1.check_quorum = true;
     n2.check_quorum = true;
     n3.check_quorum = true;
 
-    n1.become_follower(1, INVALID_ID);
-    n2.become_follower(1, INVALID_ID);
-    n3.become_follower(1, INVALID_ID);
+    n1.become_follower(1, INVALID_ID).await;
+    n2.become_follower(1, INVALID_ID).await;
+    n3.become_follower(1, INVALID_ID).await;
 
-    let mut nt = Network::new(vec![Some(n1), Some(n2), Some(n3)], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![Some(n1), Some(n2), Some(n3)], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     // check state
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
@@ -2199,12 +2277,16 @@ fn test_disruptive_follower_pre_vote() {
     assert_eq!(nt.peers[&3].state, StateRole::Follower);
 
     nt.isolate(3);
-    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
-    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
-    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
 
     nt.recover();
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
 
     // check state
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
@@ -2222,18 +2304,18 @@ fn test_disruptive_follower_pre_vote() {
     // delayed leader heartbeat does not force current leader to step down
     let mut msg = new_message(1, 3, MessageType::MsgHeartbeat, 0);
     msg.term = nt.peers[&1].term;
-    nt.send(vec![msg]);
+    nt.send(vec![msg]).await;
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
 }
 
-#[test]
-fn test_read_only_option_safe() {
+#[tokio::test]
+async fn test_read_only_option_safe() {
     let l = default_logger();
-    let a = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l);
-    let b = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l);
-    let c = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l);
+    let a = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+    let b = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+    let c = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
 
-    let mut nt = Network::new(vec![Some(a), Some(b), Some(c)], &l);
+    let mut nt = Network::new(vec![Some(a), Some(b), Some(c)], &l).await;
 
     // we can not let system choose the value of randomizedElectionTimeout
     // otherwise it will introduce some uncertainty into this test case
@@ -2245,9 +2327,10 @@ fn test_read_only_option_safe() {
         .set_randomized_election_timeout(b_election_timeout + 1);
 
     for _ in 0..b_election_timeout {
-        nt.peers.get_mut(&2).unwrap().tick();
+        nt.peers.get_mut(&2).unwrap().tick().await;
     }
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
 
@@ -2262,7 +2345,8 @@ fn test_read_only_option_safe() {
 
     for (i, (id, proposals, wri, wctx, pending)) in tests.drain(..).enumerate() {
         for _ in 0..proposals {
-            nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
+            nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+                .await;
         }
 
         let msg1 = new_message_with_entries(
@@ -2283,12 +2367,14 @@ fn test_read_only_option_safe() {
         if pending {
             // drop MsgHeartbeatResponse here to prevent leader handling pending ReadIndex request per round
             nt.ignore(MessageType::MsgHeartbeatResponse);
-            nt.send(vec![msg1.clone(), msg1.clone(), msg2.clone()]);
+            nt.send(vec![msg1.clone(), msg1.clone(), msg2.clone()])
+                .await;
             nt.recover();
             // send a ReadIndex request with the last ctx to notify leader to handle pending read requests
-            nt.send(vec![msg2.clone()]);
+            nt.send(vec![msg2.clone()]).await;
         } else {
-            nt.send(vec![msg1.clone(), msg1.clone(), msg2.clone()]);
+            nt.send(vec![msg1.clone(), msg1.clone(), msg2.clone()])
+                .await;
         }
 
         let read_states: Vec<ReadState> = nt
@@ -2317,13 +2403,13 @@ fn test_read_only_option_safe() {
     }
 }
 
-#[test]
-fn test_read_only_with_learner() {
+#[tokio::test]
+async fn test_read_only_with_learner() {
     let l = default_logger();
-    let a = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage(), &l);
-    let b = new_test_learner_raft(2, vec![1], vec![2], 10, 1, new_storage(), &l);
+    let a = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage(), &l).await;
+    let b = new_test_learner_raft(2, vec![1], vec![2], 10, 1, new_storage(), &l).await;
 
-    let mut nt = Network::new(vec![Some(a), Some(b)], &l);
+    let mut nt = Network::new(vec![Some(a), Some(b)], &l).await;
 
     // we can not let system choose the value of randomizedElectionTimeout
     // otherwise it will introduce some uncertainty into this test case
@@ -2335,9 +2421,10 @@ fn test_read_only_with_learner() {
         .set_randomized_election_timeout(b_election_timeout + 1);
 
     for _ in 0..b_election_timeout {
-        nt.peers.get_mut(&2).unwrap().tick();
+        nt.peers.get_mut(&2).unwrap().tick().await;
     }
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
     assert_eq!(nt.peers[&2].state, StateRole::Follower);
@@ -2351,7 +2438,8 @@ fn test_read_only_with_learner() {
 
     for (i, (id, proposals, wri, wctx)) in tests.drain(..).enumerate() {
         for _ in 0..proposals {
-            nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
+            nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+                .await;
         }
 
         let e = new_entry(0, 0, Some(wctx));
@@ -2360,7 +2448,8 @@ fn test_read_only_with_learner() {
             id,
             MessageType::MsgReadIndex,
             vec![e],
-        )]);
+        )])
+        .await;
 
         let read_states: Vec<ReadState> = nt
             .peers
@@ -2389,12 +2478,12 @@ fn test_read_only_with_learner() {
     }
 }
 
-#[test]
-fn test_read_only_option_lease() {
+#[tokio::test]
+async fn test_read_only_option_lease() {
     let l = default_logger();
-    let mut a = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l);
-    let mut b = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l);
-    let mut c = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l);
+    let mut a = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+    let mut b = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+    let mut c = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
     a.read_only.option = ReadOnlyOption::LeaseBased;
     b.read_only.option = ReadOnlyOption::LeaseBased;
     c.read_only.option = ReadOnlyOption::LeaseBased;
@@ -2402,7 +2491,7 @@ fn test_read_only_option_lease() {
     b.check_quorum = true;
     c.check_quorum = true;
 
-    let mut nt = Network::new(vec![Some(a), Some(b), Some(c)], &l);
+    let mut nt = Network::new(vec![Some(a), Some(b), Some(c)], &l).await;
 
     // we can not let system choose the value of randomizedElectionTimeout
     // otherwise it will introduce some uncertainty into this test case
@@ -2414,9 +2503,10 @@ fn test_read_only_option_lease() {
         .set_randomized_election_timeout(b_election_timeout + 1);
 
     for _ in 0..b_election_timeout {
-        nt.peers.get_mut(&2).unwrap().tick();
+        nt.peers.get_mut(&2).unwrap().tick().await;
     }
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
 
@@ -2431,7 +2521,8 @@ fn test_read_only_option_lease() {
 
     for (i, (id, proposals, wri, wctx)) in tests.drain(..).enumerate() {
         for _ in 0..proposals {
-            nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
+            nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+                .await;
         }
 
         let entry = new_entry(0, 0, Some(wctx));
@@ -2440,7 +2531,8 @@ fn test_read_only_option_lease() {
             id,
             MessageType::MsgReadIndex,
             vec![entry],
-        )]);
+        )])
+        .await;
 
         let read_states: Vec<ReadState> = nt
             .peers
@@ -2466,18 +2558,19 @@ fn test_read_only_option_lease() {
     }
 }
 
-#[test]
-fn test_read_only_option_lease_without_check_quorum() {
+#[tokio::test]
+async fn test_read_only_option_lease_without_check_quorum() {
     let l = default_logger();
-    let mut a = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l);
-    let mut b = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l);
-    let mut c = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l);
+    let mut a = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+    let mut b = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+    let mut c = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
     a.read_only.option = ReadOnlyOption::LeaseBased;
     b.read_only.option = ReadOnlyOption::LeaseBased;
     c.read_only.option = ReadOnlyOption::LeaseBased;
 
-    let mut nt = Network::new(vec![Some(a), Some(b), Some(c)], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![Some(a), Some(b), Some(c)], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     let ctx = "ctx1";
     let entry = new_entry(0, 0, Some(ctx));
@@ -2486,7 +2579,8 @@ fn test_read_only_option_lease_without_check_quorum() {
         2,
         MessageType::MsgReadIndex,
         vec![entry],
-    )]);
+    )])
+    .await;
 
     let read_states = &nt.peers[&2].read_states;
     assert!(!read_states.is_empty());
@@ -2498,8 +2592,8 @@ fn test_read_only_option_lease_without_check_quorum() {
 
 // `test_read_only_for_new_leader` ensures that a leader only accepts MsgReadIndex message
 // when it commits at least one log entry at it term.
-#[test]
-fn test_read_only_for_new_leader() {
+#[tokio::test]
+async fn test_read_only_for_new_leader() {
     let l = default_logger();
     let heartbeat_ticks = 1;
     let node_configs = vec![(1, 1, 1, 0), (2, 2, 2, 2), (3, 2, 2, 2)];
@@ -2507,7 +2601,7 @@ fn test_read_only_for_new_leader() {
     for (id, committed, applied, compact_index) in node_configs {
         let mut cfg = new_test_config(id, 10, heartbeat_ticks);
         cfg.applied = applied;
-        let storage = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![]));
+        let storage = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![])).await;
         let entries = vec![empty_entry(1, 1), empty_entry(1, 2)];
         storage.wl().append(&entries).unwrap();
         let mut hs = HardState::default();
@@ -2517,16 +2611,17 @@ fn test_read_only_for_new_leader() {
         if compact_index != 0 {
             storage.wl().compact(compact_index).unwrap();
         }
-        let i = new_test_raft_with_config(&cfg, storage, &l);
+        let i = new_test_raft_with_config(&cfg, storage, &l).await;
         peers.push(Some(i));
     }
-    let mut nt = Network::new(peers, &l);
+    let mut nt = Network::new(peers, &l).await;
 
     // Drop MsgAppend to forbid peer 1 to commit any log entry at its term
     // after it becomes leader.
     nt.ignore(MessageType::MsgAppend);
     // Force peer 1 to become leader
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
 
     // Ensure peer 1 drops read only request.
@@ -2537,21 +2632,24 @@ fn test_read_only_for_new_leader() {
         1,
         MessageType::MsgReadIndex,
         vec![new_entry(0, 0, Some(wctx))],
-    )]);
+    )])
+    .await;
     assert_eq!(nt.peers[&1].read_states.len(), 0);
 
     nt.recover();
 
     // Force peer 1 to commit a log entry at its term.
     for _ in 0..heartbeat_ticks {
-        nt.peers.get_mut(&1).unwrap().tick();
+        nt.peers.get_mut(&1).unwrap().tick().await;
     }
-    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
     assert_eq!(nt.peers[&1].raft_log.committed, 4);
     assert_eq!(
         nt.peers[&1]
             .raft_log
             .term(nt.peers[&1].raft_log.committed)
+            .await
             .unwrap_or(0),
         nt.peers[&1].term
     );
@@ -2562,7 +2660,8 @@ fn test_read_only_for_new_leader() {
         1,
         MessageType::MsgReadIndex,
         vec![new_entry(0, 0, Some(wctx))],
-    )]);
+    )])
+    .await;
     let read_states: Vec<ReadState> = nt
         .peers
         .get_mut(&1)
@@ -2578,36 +2677,41 @@ fn test_read_only_for_new_leader() {
 
 // `test_advance_commit_index_by_read_index_response` ensures that read index response
 // can advance the follower's commit index if it has new enough logs
-#[test]
-fn test_advance_commit_index_by_read_index_response() {
+#[tokio::test]
+async fn test_advance_commit_index_by_read_index_response() {
     let l = default_logger();
-    let mut tt = Network::new(vec![None, None, None, None, None], &l);
-    tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut tt = Network::new(vec![None, None, None, None, None], &l).await;
+    tt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     // don't commit entries
     tt.cut(1, 3);
     tt.cut(1, 4);
     tt.cut(1, 5);
-    tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
-    tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
+    tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
+    tt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
 
     tt.recover();
     tt.cut(1, 2);
 
     // commit entries for leader but not node 2
-    tt.send(vec![new_message(3, 1, MessageType::MsgReadIndex, 1)]);
+    tt.send(vec![new_message(3, 1, MessageType::MsgReadIndex, 1)])
+        .await;
     assert_eq!(tt.peers[&1].raft_log.committed, 3);
     assert_eq!(tt.peers[&2].raft_log.committed, 1);
 
     tt.recover();
     // use LeaseBased so leader won't send MsgHeartbeat to advance node 2's commit index
     tt.peers.get_mut(&1).unwrap().read_only.option = ReadOnlyOption::LeaseBased;
-    tt.send(vec![new_message(2, 1, MessageType::MsgReadIndex, 1)]);
+    tt.send(vec![new_message(2, 1, MessageType::MsgReadIndex, 1)])
+        .await;
     assert_eq!(tt.peers[&2].raft_log.committed, 3);
 }
 
-#[test]
-fn test_leader_append_response() {
+#[tokio::test]
+async fn test_leader_append_response() {
     let l = default_logger();
     // Initial progress: match = 0, next = 4 on followers.
     let mut tests = vec![
@@ -2624,14 +2728,14 @@ fn test_leader_append_response() {
         tests.drain(..).enumerate()
     {
         // Initial raft logs: last index = 3, committed = 1.
-        let store = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![]));
+        let store = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![])).await;
         let ents = &[empty_entry(0, 1), empty_entry(1, 2)];
         store.wl().append(ents).unwrap();
-        let mut sm = new_test_raft(1, vec![1, 2, 3], 10, 1, store, &l);
+        let mut sm = new_test_raft(1, vec![1, 2, 3], 10, 1, store, &l).await;
 
         // sm term is 2 after it becomes the leader.
-        sm.become_candidate();
-        sm.become_leader();
+        sm.become_candidate().await;
+        sm.become_leader().await;
 
         sm.read_messages();
         let mut m = new_message(2, 0, MessageType::MsgAppendResponse, 0);
@@ -2639,7 +2743,7 @@ fn test_leader_append_response() {
         m.term = sm.term;
         m.reject = reject;
         m.reject_hint = index;
-        sm.step(m).expect("");
+        sm.step(m).await.expect("");
 
         if sm.prs().get(2).unwrap().matched != wmatch {
             panic!(
@@ -2675,23 +2779,23 @@ fn test_leader_append_response() {
 
 // When the leader receives a heartbeat tick, it should
 // send a MsgApp with m.Index = 0, m.LogTerm=0 and empty entries.
-#[test]
-fn test_bcast_beat() {
+#[tokio::test]
+async fn test_bcast_beat() {
     let l = default_logger();
     // make a state machine with log.offset = 1000
     let offset = 1000u64;
     let s = new_snapshot(offset, 1, vec![1, 2, 3]);
     let store = new_storage();
     store.wl().apply_snapshot(s).expect("");
-    let mut sm = new_test_raft(1, vec![1, 2, 3], 10, 1, store, &l);
+    let mut sm = new_test_raft(1, vec![1, 2, 3], 10, 1, store, &l).await;
     sm.term = 1;
 
-    sm.become_candidate();
-    sm.become_leader();
+    sm.become_candidate().await;
+    sm.become_leader().await;
     for i in 0..10 {
         let _ = sm.append_entry(&mut [empty_entry(0, offset + i + 1)]);
     }
-    sm.persist();
+    sm.persist().await;
     // slow follower
     let mut_pr = |sm: &mut Interface, n, matched, next_idx| {
         let m = sm.mut_prs().get_mut(n).unwrap();
@@ -2701,10 +2805,11 @@ fn test_bcast_beat() {
     // slow follower
     mut_pr(&mut sm, 2, offset + 5, offset + 6);
     // normal follower
-    let last_index = sm.raft_log.last_index();
+    let last_index = sm.raft_log.last_index().await;
     mut_pr(&mut sm, 3, last_index, last_index + 1);
 
     sm.step(new_message(0, 0, MessageType::MsgBeat, 0))
+        .await
         .expect("");
     let mut msgs = sm.read_messages();
     assert_eq!(msgs.len(), 2);
@@ -2751,8 +2856,8 @@ fn test_bcast_beat() {
 }
 
 // tests the output of the statemachine when receiving MsgBeat
-#[test]
-fn test_recv_msg_beat() {
+#[tokio::test]
+async fn test_recv_msg_beat() {
     let l = default_logger();
     let mut tests = vec![
         (StateRole::Leader, 2),
@@ -2762,13 +2867,14 @@ fn test_recv_msg_beat() {
     ];
 
     for (i, (state, w_msg)) in tests.drain(..).enumerate() {
-        let store = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![]));
+        let store = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![])).await;
         let ents = &[empty_entry(0, 1), empty_entry(1, 2)];
         store.wl().append(ents).unwrap();
 
-        let mut sm = new_test_raft(1, vec![1, 2, 3], 10, 1, store, &l);
+        let mut sm = new_test_raft(1, vec![1, 2, 3], 10, 1, store, &l).await;
         sm.state = state;
         sm.step(new_message(1, 1, MessageType::MsgBeat, 0))
+            .await
             .expect("");
 
         let msgs = sm.read_messages();
@@ -2788,8 +2894,8 @@ fn test_recv_msg_beat() {
     }
 }
 
-#[test]
-fn test_leader_increase_next() {
+#[tokio::test]
+async fn test_leader_increase_next() {
     let l = default_logger();
     let previous_ents = vec![empty_entry(1, 1), empty_entry(1, 2), empty_entry(1, 3)];
     let mut tests = vec![
@@ -2804,14 +2910,15 @@ fn test_leader_increase_next() {
         (ProgressState::Probe, 2, 2),
     ];
     for (i, (state, next_idx, wnext)) in tests.drain(..).enumerate() {
-        let mut sm = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l);
-        sm.raft_log.append(&previous_ents);
-        sm.persist();
-        sm.become_candidate();
-        sm.become_leader();
+        let mut sm = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l).await;
+        sm.raft_log.append(&previous_ents).await;
+        sm.persist().await;
+        sm.become_candidate().await;
+        sm.become_leader().await;
         sm.mut_prs().get_mut(2).unwrap().state = state;
         sm.mut_prs().get_mut(2).unwrap().next_idx = next_idx;
         sm.step(new_message(1, 1, MessageType::MsgPropose, 1))
+            .await
             .expect("");
 
         if sm.prs().get(2).unwrap().next_idx != wnext {
@@ -2825,12 +2932,12 @@ fn test_leader_increase_next() {
     }
 }
 
-#[test]
-fn test_send_append_for_progress_probe() {
+#[tokio::test]
+async fn test_send_append_for_progress_probe() {
     let l = default_logger();
-    let mut r = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l);
-    r.become_candidate();
-    r.become_leader();
+    let mut r = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l).await;
+    r.become_candidate().await;
+    r.become_leader().await;
     r.read_messages();
     r.mut_prs().get_mut(2).unwrap().become_probe();
 
@@ -2841,7 +2948,7 @@ fn test_send_append_for_progress_probe() {
             // loop. After that, the follower is paused until a heartbeat response is
             // received.
             let _ = r.append_entry(&mut [new_entry(0, 0, SOME_DATA)]);
-            r.send_append(2);
+            r.send_append(2).await;
             let msg = r.read_messages();
             assert_eq!(msg.len(), 1);
             assert_eq!(msg[0].index, 0);
@@ -2850,13 +2957,14 @@ fn test_send_append_for_progress_probe() {
         assert!(r.prs().get(2).unwrap().paused);
         for _ in 0..10 {
             let _ = r.append_entry(&mut [new_entry(0, 0, SOME_DATA)]);
-            r.send_append(2);
+            r.send_append(2).await;
             assert_eq!(r.read_messages().len(), 0);
         }
 
         // do a heartbeat
         for _ in 0..r.heartbeat_timeout() {
             r.step(new_message(1, 1, MessageType::MsgBeat, 0))
+                .await
                 .expect("");
         }
         assert!(r.prs().get(2).unwrap().paused);
@@ -2869,6 +2977,7 @@ fn test_send_append_for_progress_probe() {
 
     // a heartbeat response will allow another message to be sent
     r.step(new_message(2, 1, MessageType::MsgHeartbeatResponse, 0))
+        .await
         .expect("");
     let msg = r.read_messages();
     assert_eq!(msg.len(), 1);
@@ -2876,47 +2985,47 @@ fn test_send_append_for_progress_probe() {
     assert!(r.prs().get(2).unwrap().paused);
 }
 
-#[test]
-fn test_send_append_for_progress_replicate() {
+#[tokio::test]
+async fn test_send_append_for_progress_replicate() {
     let l = default_logger();
-    let mut r = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l);
-    r.become_candidate();
-    r.become_leader();
+    let mut r = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l).await;
+    r.become_candidate().await;
+    r.become_leader().await;
     r.read_messages();
     r.mut_prs().get_mut(2).unwrap().become_replicate();
 
     for _ in 0..10 {
         let _ = r.append_entry(&mut [new_entry(0, 0, SOME_DATA)]);
-        r.send_append(2);
+        r.send_append(2).await;
         assert_eq!(r.read_messages().len(), 1);
     }
 }
 
-#[test]
-fn test_send_append_for_progress_snapshot() {
+#[tokio::test]
+async fn test_send_append_for_progress_snapshot() {
     let l = default_logger();
-    let mut r = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l);
-    r.become_candidate();
-    r.become_leader();
+    let mut r = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l).await;
+    r.become_candidate().await;
+    r.become_leader().await;
     r.read_messages();
     r.mut_prs().get_mut(2).unwrap().become_snapshot(10);
 
     for _ in 0..10 {
         let _ = r.append_entry(&mut [new_entry(0, 0, SOME_DATA)]);
-        r.send_append(2);
+        r.send_append(2).await;
         assert_eq!(r.read_messages().len(), 0);
     }
 }
 
-#[test]
-fn test_recv_msg_unreachable() {
+#[tokio::test]
+async fn test_recv_msg_unreachable() {
     let l = default_logger();
     let previous_ents = vec![empty_entry(1, 1), empty_entry(1, 2), empty_entry(1, 3)];
     let s = new_storage();
     s.wl().append(&previous_ents).unwrap();
-    let mut r = new_test_raft(1, vec![1, 2], 10, 1, s, &l);
-    r.become_candidate();
-    r.become_leader();
+    let mut r = new_test_raft(1, vec![1, 2], 10, 1, s, &l).await;
+    r.become_candidate().await;
+    r.become_leader().await;
     r.read_messages();
     // set node 2 to state replicate
     r.mut_prs().get_mut(2).unwrap().matched = 3;
@@ -2924,6 +3033,7 @@ fn test_recv_msg_unreachable() {
     r.mut_prs().get_mut(2).unwrap().optimistic_update(5);
 
     r.step(new_message(2, 1, MessageType::MsgUnreachable, 0))
+        .await
         .expect("");
 
     let peer_2 = r.prs().get(2).unwrap();
@@ -2931,18 +3041,22 @@ fn test_recv_msg_unreachable() {
     assert_eq!(peer_2.matched + 1, peer_2.next_idx);
 }
 
-#[test]
-fn test_restore() {
+#[tokio::test]
+async fn test_restore() {
     let l = default_logger();
     // magic number
     let s = new_snapshot(11, 11, vec![1, 2, 3]);
 
-    let mut sm = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l);
-    assert!(sm.restore(s.clone()));
-    assert_eq!(sm.raft_log.last_index(), s.metadata.as_ref().unwrap().index);
+    let mut sm = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l).await;
+    assert!(sm.restore(s.clone()).await);
+    assert_eq!(
+        sm.raft_log.last_index().await,
+        s.metadata.as_ref().unwrap().index
+    );
     assert_eq!(
         sm.raft_log
             .term(s.metadata.as_ref().unwrap().index)
+            .await
             .unwrap(),
         s.metadata.as_ref().unwrap().term
     );
@@ -2952,105 +3066,108 @@ fn test_restore() {
             .conf_state.as_ref().unwrap()
             .voters
     );
-    assert!(!sm.restore(s));
+    assert!(!sm.restore(s).await);
 }
 
-#[test]
-fn test_restore_ignore_snapshot() {
+#[tokio::test]
+async fn test_restore_ignore_snapshot() {
     let l = default_logger();
     let previous_ents = vec![empty_entry(1, 1), empty_entry(1, 2), empty_entry(1, 3)];
     let commit = 1u64;
-    let mut sm = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l);
-    sm.raft_log.append(&previous_ents);
-    sm.raft_log.commit_to(commit);
+    let mut sm = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l).await;
+    sm.raft_log.append(&previous_ents).await;
+    sm.raft_log.commit_to(commit).await;
 
     let mut s = new_snapshot(commit, 1, vec![1, 2]);
 
     // ingore snapshot
-    assert!(!sm.restore(s.clone()));
+    assert!(!sm.restore(s.clone()).await);
     assert_eq!(sm.raft_log.committed, commit);
 
     // ignore snapshot and fast forward commit
     s.metadata.as_mut().unwrap().index = commit + 1;
-    assert!(!sm.restore(s));
+    assert!(!sm.restore(s).await);
     assert_eq!(sm.raft_log.committed, commit + 1);
 }
 
-#[test]
-fn test_provide_snap() {
+#[tokio::test]
+async fn test_provide_snap() {
     let l = default_logger();
     // restore the state machine from a snapshot so it has a compacted log and a snapshot
     let s = new_snapshot(11, 11, vec![1, 2]); // magic number
 
-    let mut sm = new_test_raft(1, vec![1], 10, 1, new_storage(), &l);
-    sm.restore(s);
-    sm.persist();
+    let mut sm = new_test_raft(1, vec![1], 10, 1, new_storage(), &l).await;
+    sm.restore(s).await;
+    sm.persist().await;
 
-    sm.become_candidate();
-    sm.become_leader();
+    sm.become_candidate().await;
+    sm.become_leader().await;
 
     // force set the next of node 2, so that node 2 needs a snapshot
-    sm.mut_prs().get_mut(2).unwrap().next_idx = sm.raft_log.first_index();
+    sm.mut_prs().get_mut(2).unwrap().next_idx = sm.raft_log.first_index().await;
     let mut m = new_message(2, 1, MessageType::MsgAppendResponse, 0);
     m.index = sm.prs().get(2).unwrap().next_idx - 1;
     m.reject = true;
-    sm.step(m).expect("");
+    sm.step(m).await.expect("");
 
     let msgs = sm.read_messages();
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].msg_type(), MessageType::MsgSnapshot);
 }
 
-#[test]
-fn test_ignore_providing_snapshot() {
+#[tokio::test]
+async fn test_ignore_providing_snapshot() {
     let l = default_logger();
     // restore the state machine from a snapshot so it has a compacted log and a snapshot
     let s = new_snapshot(11, 11, vec![1, 2]); // magic number
-    let mut sm = new_test_raft(1, vec![1], 10, 1, new_storage(), &l);
-    sm.restore(s);
-    sm.persist();
+    let mut sm = new_test_raft(1, vec![1], 10, 1, new_storage(), &l).await;
+    sm.restore(s).await;
+    sm.persist().await;
 
-    sm.become_candidate();
-    sm.become_leader();
+    sm.become_candidate().await;
+    sm.become_leader().await;
 
     // force set the next of node 2, so that node 2 needs a snapshot
     // change node 2 to be inactive, expect node 1 ignore sending snapshot to 2
-    sm.mut_prs().get_mut(2).unwrap().next_idx = sm.raft_log.first_index() - 1;
+    sm.mut_prs().get_mut(2).unwrap().next_idx = sm.raft_log.first_index().await - 1;
     sm.mut_prs().get_mut(2).unwrap().recent_active = false;
 
     sm.step(new_message(1, 1, MessageType::MsgPropose, 1))
+        .await
         .expect("");
 
     assert_eq!(sm.read_messages().len(), 0);
 }
 
-#[test]
-fn test_restore_from_snap_msg() {
+#[tokio::test]
+async fn test_restore_from_snap_msg() {
     let l = default_logger();
     let s = new_snapshot(11, 11, vec![1, 2]); // magic number
-    let mut sm = new_test_raft(2, vec![1, 2], 10, 1, new_storage(), &l);
+    let mut sm = new_test_raft(2, vec![1, 2], 10, 1, new_storage(), &l).await;
     let mut m = new_message(1, 0, MessageType::MsgSnapshot, 0);
     m.term = 2;
     m.snapshot = Some(s);
 
-    sm.step(m).expect("");
+    sm.step(m).await.expect("");
 
     assert_eq!(sm.leader_id, 1);
 
     // TODO: port the remaining if upstream completed this test.
 }
 
-#[test]
-fn test_slow_node_restore() {
+#[tokio::test]
+async fn test_slow_node_restore() {
     let l = default_logger();
-    let mut nt = Network::new(vec![None, None, None], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![None, None, None], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     nt.isolate(3);
     for _ in 0..100 {
-        nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
+        nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+            .await;
     }
-    next_ents(nt.peers.get_mut(&1).unwrap(), &nt.storage[&1]);
+    next_ents(nt.peers.get_mut(&1).unwrap(), &nt.storage[&1]).await;
     nt.storage[&1]
         .wl()
         .commit_to(nt.peers[&1].raft_log.applied)
@@ -3064,17 +3181,20 @@ fn test_slow_node_restore() {
     // send heartbeats so that the leader can learn everyone is active.
     // node 3 will only be considered as active when node 1 receives a reply from it.
     loop {
-        nt.send(vec![new_message(1, 1, MessageType::MsgBeat, 0)]);
+        nt.send(vec![new_message(1, 1, MessageType::MsgBeat, 0)])
+            .await;
         if nt.peers[&1].prs().get(3).unwrap().recent_active {
             break;
         }
     }
 
     // trigger a snapshot
-    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
 
     // trigger a commit
-    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
     assert_eq!(
         nt.peers[&3].raft_log.committed,
         nt.peers[&1].raft_log.committed
@@ -3083,49 +3203,50 @@ fn test_slow_node_restore() {
 
 // test_step_config tests that when raft step msgProp in EntryConfChange type,
 // it appends the entry to log and sets pendingConf to be true.
-#[test]
-fn test_step_config() {
+#[tokio::test]
+async fn test_step_config() {
     let l = default_logger();
     // a raft that cannot make progress
-    let mut r = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l);
-    r.become_candidate();
-    r.become_leader();
-    let index = r.raft_log.last_index();
+    let mut r = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l).await;
+    r.become_candidate().await;
+    r.become_leader().await;
+    let index = r.raft_log.last_index().await;
     let mut m = new_message(1, 1, MessageType::MsgPropose, 0);
     let mut e = Entry::default();
     e.set_entry_type(EntryType::EntryConfChange);
     m.entries.push(e);
-    r.step(m).expect("");
-    assert_eq!(r.raft_log.last_index(), index + 1);
+    r.step(m).await.expect("");
+    assert_eq!(r.raft_log.last_index().await, index + 1);
 }
 
 // test_step_ignore_config tests that if raft step the second msgProp in
 // EntryConfChange type when the first one is uncommitted, the node will set
 // the proposal to noop and keep its original state.
-#[test]
-fn test_step_ignore_config() {
+#[tokio::test]
+async fn test_step_ignore_config() {
     let l = default_logger();
     // a raft that cannot make progress
-    let mut r = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l);
-    r.become_candidate();
-    r.become_leader();
+    let mut r = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l).await;
+    r.become_candidate().await;
+    r.become_leader().await;
     assert!(!r.has_pending_conf());
     let mut m = new_message(1, 1, MessageType::MsgPropose, 0);
     let mut e = Entry::default();
     e.set_entry_type(EntryType::EntryConfChange);
     m.entries.push(e);
     assert!(!r.has_pending_conf());
-    r.step(m.clone()).expect("");
+    r.step(m.clone()).await.expect("");
     assert!(r.has_pending_conf());
-    let index = r.raft_log.last_index();
+    let index = r.raft_log.last_index().await;
     let pending_conf_index = r.pending_conf_index;
-    r.step(m).expect("");
+    r.step(m).await.expect("");
     let mut we = empty_entry(1, 3);
     we.set_entry_type(EntryType::EntryNormal);
     let wents = vec![we];
     let entries = r
         .raft_log
         .entries(index + 1, None, GetEntriesContext::empty(false))
+        .await
         .expect("");
     assert_eq!(entries, wents);
     assert_eq!(r.pending_conf_index, pending_conf_index);
@@ -3133,20 +3254,20 @@ fn test_step_ignore_config() {
 
 // test_new_leader_pending_config tests that new leader sets its pending_conf_index
 // based on uncommitted entries.
-#[test]
-fn test_new_leader_pending_config() {
+#[tokio::test]
+async fn test_new_leader_pending_config() {
     let l = default_logger();
     let mut tests = vec![(false, 0), (true, 1)];
     for (i, (add_entry, wpending_index)) in tests.drain(..).enumerate() {
-        let mut r = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l);
+        let mut r = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l).await;
         let mut e = Entry::default();
         if add_entry {
             e.set_entry_type(EntryType::EntryNormal);
-            let _ = r.append_entry(&mut [e]);
-            r.persist();
+            let _ = r.append_entry(&mut [e]).await;
+            r.persist().await;
         }
-        r.become_candidate();
-        r.become_leader();
+        r.become_candidate().await;
+        r.become_leader().await;
         if r.pending_conf_index != wpending_index {
             panic!(
                 "#{}: pending_conf_index = {}, want {}",
@@ -3158,11 +3279,11 @@ fn test_new_leader_pending_config() {
 }
 
 // test_add_node tests that add_node could update nodes correctly.
-#[test]
-fn test_add_node() -> Result<()> {
+#[tokio::test]
+async fn test_add_node() -> Result<()> {
     let l = default_logger();
-    let mut r = new_test_raft(1, vec![1], 10, 1, new_storage(), &l);
-    r.apply_conf_change(&add_node(2))?;
+    let mut r = new_test_raft(1, vec![1], 10, 1, new_storage(), &l).await;
+    r.apply_conf_change(&add_node(2)).await?;
     assert_iter_eq!(o r.prs().conf().voters().ids(),
         vec![1, 2]
     );
@@ -3170,24 +3291,24 @@ fn test_add_node() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_add_node_check_quorum() -> Result<()> {
+#[tokio::test]
+async fn test_add_node_check_quorum() -> Result<()> {
     let l = default_logger();
-    let mut r = new_test_raft(1, vec![1], 10, 1, new_storage(), &l);
+    let mut r = new_test_raft(1, vec![1], 10, 1, new_storage(), &l).await;
 
     r.check_quorum = true;
 
-    r.become_candidate();
-    r.become_leader();
+    r.become_candidate().await;
+    r.become_leader().await;
 
     for _ in 0..r.election_timeout() - 1 {
-        r.tick();
+        r.tick().await;
     }
 
-    r.apply_conf_change(&add_node(2))?;
+    r.apply_conf_change(&add_node(2)).await?;
 
     // This tick will reach electionTimeout, which triggers a quorum check.
-    r.tick();
+    r.tick().await;
 
     // Node 1 should still be the leader after a single tick.
     assert_eq!(r.state, StateRole::Leader);
@@ -3195,7 +3316,7 @@ fn test_add_node_check_quorum() -> Result<()> {
     // After another electionTimeout ticks without hearing from node 2,
     // node 1 should step down.
     for _ in 0..r.election_timeout() {
-        r.tick();
+        r.tick().await;
     }
 
     assert_eq!(r.state, StateRole::Follower);
@@ -3205,32 +3326,32 @@ fn test_add_node_check_quorum() -> Result<()> {
 
 // test_remove_node tests that removeNode could update pendingConf, nodes and
 // and removed list correctly.
-#[test]
-fn test_remove_node() -> Result<()> {
+#[tokio::test]
+async fn test_remove_node() -> Result<()> {
     let l = default_logger();
-    let mut r = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l);
-    r.apply_conf_change(&remove_node(2))?;
+    let mut r = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l).await;
+    r.apply_conf_change(&remove_node(2)).await?;
     assert_iter_eq!(o r.prs().conf().voters().ids(), vec![1]);
 
     // Removing all voters is not allowed.
-    assert!(r.apply_conf_change(&remove_node(1)).is_err());
+    assert!(r.apply_conf_change(&remove_node(1)).await.is_err());
     assert_iter_eq!(o r.prs().conf().voters().ids(), vec![1]);
 
     Ok(())
 }
 
-#[test]
-fn test_remove_node_itself() {
+#[tokio::test]
+async fn test_remove_node_itself() {
     let l = default_logger();
-    let mut n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage(), &l);
+    let mut n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage(), &l).await;
 
-    assert!(n1.apply_conf_change(&remove_node(1)).is_err());
+    assert!(n1.apply_conf_change(&remove_node(1)).await.is_err());
     assert_iter_eq!(n1.prs().conf().learners(), vec![2]);
     assert_iter_eq!(o n1.prs().conf().voters().ids(), vec![1]);
 }
 
-#[test]
-fn test_promotable() {
+#[tokio::test]
+async fn test_promotable() {
     let l = default_logger();
     let id = 1u64;
     let mut tests = vec![
@@ -3240,22 +3361,22 @@ fn test_promotable() {
         (vec![2, 3], false),
     ];
     for (i, (peers, wp)) in tests.drain(..).enumerate() {
-        let r = new_test_raft(id, peers, 5, 1, new_storage(), &l);
+        let r = new_test_raft(id, peers, 5, 1, new_storage(), &l).await;
         if r.promotable() != wp {
             panic!("#{}: promotable = {}, want {}", i, r.promotable(), wp);
         }
     }
 }
 
-#[test]
-fn test_raft_nodes() {
+#[tokio::test]
+async fn test_raft_nodes() {
     let l = default_logger();
     let mut tests = vec![
         (vec![1, 2, 3], vec![1, 2, 3]),
         (vec![3, 2, 1], vec![1, 2, 3]),
     ];
     for (i, (ids, wids)) in tests.drain(..).enumerate() {
-        let r = new_test_raft(1, ids, 10, 1, new_storage(), &l);
+        let r = new_test_raft(1, ids, 10, 1, new_storage(), &l).await;
         let voter_ids: HashSet<_> = r.prs().conf().voters().ids().iter().collect();
         let wids = wids.into_iter().collect::<HashSet<_>>();
         if voter_ids != wids {
@@ -3264,41 +3385,45 @@ fn test_raft_nodes() {
     }
 }
 
-#[test]
-fn test_campaign_while_leader() {
+#[tokio::test]
+async fn test_campaign_while_leader() {
     let l = default_logger();
-    test_campaign_while_leader_with_pre_vote(false, &l);
+    test_campaign_while_leader_with_pre_vote(false, &l).await;
 }
 
-#[test]
-fn test_pre_campaign_while_leader() {
+#[tokio::test]
+async fn test_pre_campaign_while_leader() {
     let l = default_logger();
-    test_campaign_while_leader_with_pre_vote(true, &l);
+    test_campaign_while_leader_with_pre_vote(true, &l).await;
 }
 
-fn test_campaign_while_leader_with_pre_vote(pre_vote: bool, l: &Logger) {
-    let mut r = new_test_raft_with_prevote(1, vec![1], 5, 1, new_storage(), pre_vote, l);
+async fn test_campaign_while_leader_with_pre_vote(pre_vote: bool, l: &Logger) {
+    let mut r = new_test_raft_with_prevote(1, vec![1], 5, 1, new_storage(), pre_vote, l).await;
     assert_eq!(r.state, StateRole::Follower);
     // We don't call campaign() directly because it comes after the check
     // for our current state.
-    r.step(new_message(1, 1, MessageType::MsgHup, 0)).expect("");
+    r.step(new_message(1, 1, MessageType::MsgHup, 0))
+        .await
+        .expect("");
     assert_eq!(r.state, StateRole::Leader);
     let term = r.term;
-    r.step(new_message(1, 1, MessageType::MsgHup, 0)).expect("");
+    r.step(new_message(1, 1, MessageType::MsgHup, 0))
+        .await
+        .expect("");
     assert_eq!(r.state, StateRole::Leader);
     assert_eq!(r.term, term);
 }
 
 // test_commit_after_remove_node verifies that pending commands can become
 // committed when a config change reduces the quorum requirements.
-#[test]
-fn test_commit_after_remove_node() -> Result<()> {
+#[tokio::test]
+async fn test_commit_after_remove_node() -> Result<()> {
     let l = default_logger();
     // Create a cluster with two nodes.
     let s = new_storage();
-    let mut r = new_test_raft(1, vec![1, 2], 5, 1, s.clone(), &l);
-    r.become_candidate();
-    r.become_leader();
+    let mut r = new_test_raft(1, vec![1, 2], 5, 1, s.clone(), &l).await;
+    r.become_candidate().await;
+    r.become_leader().await;
 
     // Begin to remove the second node.
     let mut msg = new_message(0, 0, MessageType::MsgPropose, 0);
@@ -3310,23 +3435,23 @@ fn test_commit_after_remove_node() -> Result<()> {
     let ccdata = cc.encode_to_vec();
     entry.data = ccdata;
     msg.entries.push(entry);
-    r.step(msg).expect("");
+    r.step(msg).await.expect("");
     // Stabilize the log and make sure nothing is committed yet.
-    assert_eq!(next_ents(&mut r, &s).len(), 0);
-    let cc_index = r.raft_log.last_index();
+    assert_eq!(next_ents(&mut r, &s).await.len(), 0);
+    let cc_index = r.raft_log.last_index().await;
 
     // While the config change is pending, make another proposal.
     let mut msg = new_message(0, 0, MessageType::MsgPropose, 0);
     let mut entry = new_entry(0, 0, Some("hello"));
     entry.set_entry_type(EntryType::EntryNormal);
     msg.entries.push(entry);
-    r.step(msg).expect("");
+    r.step(msg).await.expect("");
 
     // Node 2 acknowledges the config change, committing it.
     let mut msg = new_message(2, 0, MessageType::MsgAppendResponse, 0);
     msg.index = cc_index;
-    r.step(msg).expect("");
-    let ents = next_ents(&mut r, &s);
+    r.step(msg).await.expect("");
+    let ents = next_ents(&mut r, &s).await;
     assert_eq!(ents.len(), 2);
     assert_eq!(ents[0].entry_type(), EntryType::EntryNormal);
     assert!(ents[0].data.is_empty());
@@ -3334,8 +3459,8 @@ fn test_commit_after_remove_node() -> Result<()> {
 
     // Apply the config change. This reduces quorum requirements so the
     // pending command can now commit.
-    r.apply_conf_change(&remove_node(2))?;
-    let ents = next_ents(&mut r, &s);
+    r.apply_conf_change(&remove_node(2)).await?;
+    let ents = next_ents(&mut r, &s).await;
     assert_eq!(ents.len(), 1);
     assert_eq!(ents[0].entry_type(), EntryType::EntryNormal);
     assert_eq!(&ents[0].data, b"hello");
@@ -3345,22 +3470,26 @@ fn test_commit_after_remove_node() -> Result<()> {
 
 // test_leader_transfer_to_uptodate_node verifies transferring should succeed
 // if the transferee has the most up-to-date log entries when transfer starts.
-#[test]
-fn test_leader_transfer_to_uptodate_node() {
+#[tokio::test]
+async fn test_leader_transfer_to_uptodate_node() {
     let l = default_logger();
-    let mut nt = Network::new(vec![None, None, None], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![None, None, None], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     let lead_id = nt.peers[&1].leader_id;
     assert_eq!(lead_id, 1);
 
     // Transfer leadership to peer 2.
-    nt.send(vec![new_message(2, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(2, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
     check_leader_transfer_state(&nt.peers[&1], StateRole::Follower, 2);
 
     // After some log replication, transfer leadership back to peer 1.
-    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
-    nt.send(vec![new_message(1, 2, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
+    nt.send(vec![new_message(1, 2, MessageType::MsgTransferLeader, 0)])
+        .await;
     check_leader_transfer_state(&nt.peers[&1], StateRole::Leader, 1);
 }
 
@@ -3369,31 +3498,35 @@ fn test_leader_transfer_to_uptodate_node() {
 // Not like test_leader_transfer_to_uptodate_node, where the leader transfer message
 // is sent to the leader, in this test case every leader transfer message is sent
 // to the follower.
-#[test]
-fn test_leader_transfer_to_uptodate_node_from_follower() {
+#[tokio::test]
+async fn test_leader_transfer_to_uptodate_node_from_follower() {
     let l = default_logger();
-    let mut nt = Network::new(vec![None, None, None], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![None, None, None], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     let lead_id = nt.peers[&1].leader_id;
     assert_eq!(lead_id, 1);
 
     // transfer leadership to peer 2.
-    nt.send(vec![new_message(2, 2, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(2, 2, MessageType::MsgTransferLeader, 0)])
+        .await;
     check_leader_transfer_state(&nt.peers[&1], StateRole::Follower, 2);
 
     // After some log replication, transfer leadership back to peer 1.
-    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
-    nt.send(vec![new_message(1, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
     check_leader_transfer_state(&nt.peers[&1], StateRole::Leader, 1);
 }
 
 // TestLeaderTransferWithCheckQuorum ensures transferring leader still works
 // even the current leader is still under its leader lease
-#[test]
-fn test_leader_transfer_with_check_quorum() {
+#[tokio::test]
+async fn test_leader_transfer_with_check_quorum() {
     let l = default_logger();
-    let mut nt = Network::new(vec![None, None, None], &l);
+    let mut nt = Network::new(vec![None, None, None], &l).await;
     for i in 1..4 {
         let r = &mut nt.peers.get_mut(&i).unwrap();
         r.check_quorum = true;
@@ -3409,50 +3542,59 @@ fn test_leader_transfer_with_check_quorum() {
 
     // Letting peer 2 electionElapsed reach to timeout so that it can vote for peer 1
     for _ in 0..b_election_timeout {
-        nt.peers.get_mut(&2).unwrap().tick();
+        nt.peers.get_mut(&2).unwrap().tick().await;
     }
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     assert_eq!(nt.peers[&1].leader_id, 1);
 
     // Transfer leadership to 2.
-    nt.send(vec![new_message(2, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(2, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
     check_leader_transfer_state(&nt.peers[&1], StateRole::Follower, 2);
 
     // After some log replication, transfer leadership back to 1.
-    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
-    nt.send(vec![new_message(1, 2, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
+    nt.send(vec![new_message(1, 2, MessageType::MsgTransferLeader, 0)])
+        .await;
     check_leader_transfer_state(&nt.peers[&1], StateRole::Leader, 1);
 }
 
-#[test]
-fn test_leader_transfer_to_slow_follower() {
+#[tokio::test]
+async fn test_leader_transfer_to_slow_follower() {
     let l = default_logger();
-    let mut nt = Network::new(vec![None, None, None], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![None, None, None], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     nt.isolate(3);
-    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
 
     nt.recover();
     assert_eq!(nt.peers[&1].prs().get(3).unwrap().matched, 1);
 
     // Transfer leadership to 3 when node 3 is lack of log.
-    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
 
     check_leader_transfer_state(&nt.peers[&1], StateRole::Follower, 3);
 }
 
-#[test]
-fn test_leader_transfer_after_snapshot() {
+#[tokio::test]
+async fn test_leader_transfer_after_snapshot() {
     let l = default_logger();
-    let mut nt = Network::new(vec![None, None, None], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![None, None, None], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     nt.isolate(3);
 
-    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
-    next_ents(nt.peers.get_mut(&1).unwrap(), &nt.storage[&1]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
+    next_ents(nt.peers.get_mut(&1).unwrap(), &nt.storage[&1]).await;
     nt.storage[&1]
         .wl()
         .commit_to(nt.peers[&1].raft_log.applied)
@@ -3466,101 +3608,115 @@ fn test_leader_transfer_after_snapshot() {
     assert_eq!(nt.peers[&1].prs().get(3).unwrap().matched, 1);
 
     // Transfer leadership to 3 when node 3 is lack of snapshot.
-    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
     // Send pb.MsgHeartbeatResp to leader to trigger a snapshot for node 3.
     nt.send(vec![new_message(
         3,
         1,
         MessageType::MsgHeartbeatResponse,
         0,
-    )]);
+    )])
+    .await;
 
     check_leader_transfer_state(&nt.peers[&1], StateRole::Follower, 3);
 }
 
-#[test]
-fn test_leader_transfer_to_self() {
+#[tokio::test]
+async fn test_leader_transfer_to_self() {
     let l = default_logger();
-    let mut nt = Network::new(vec![None, None, None], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![None, None, None], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     // Transfer leadership to self, there will be noop.
-    nt.send(vec![new_message(1, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
     check_leader_transfer_state(&nt.peers[&1], StateRole::Leader, 1);
 }
 
-#[test]
-fn test_leader_transfer_to_non_existing_node() {
+#[tokio::test]
+async fn test_leader_transfer_to_non_existing_node() {
     let l = default_logger();
-    let mut nt = Network::new(vec![None, None, None], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![None, None, None], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     // Transfer leadership to non-existing node, there will be noop.
-    nt.send(vec![new_message(4, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(4, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
     check_leader_transfer_state(&nt.peers[&1], StateRole::Leader, 1);
 }
 
-#[test]
-fn test_leader_transfer_to_learner() {
+#[tokio::test]
+async fn test_leader_transfer_to_learner() {
     let l = default_logger();
-    let s = MemStorage::new_with_conf_state((vec![1], vec![2]));
+    let s = MemStorage::new_with_conf_state((vec![1], vec![2])).await;
     let c = new_test_config(1, 10, 1);
-    let leader = new_test_raft_with_config(&c, s, &l);
+    let leader = new_test_raft_with_config(&c, s, &l).await;
 
-    let s = MemStorage::new_with_conf_state((vec![1], vec![2]));
+    let s = MemStorage::new_with_conf_state((vec![1], vec![2])).await;
     let c = new_test_config(2, 10, 1);
-    let learner = new_test_raft_with_config(&c, s, &l);
+    let learner = new_test_raft_with_config(&c, s, &l).await;
 
-    let mut nt = Network::new(vec![Some(leader), Some(learner)], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![Some(leader), Some(learner)], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     // Transfer leadership to learner node, there will be noop.
-    nt.send(vec![new_message(2, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(2, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
     check_leader_transfer_state(&nt.peers[&1], StateRole::Leader, 1);
 }
 
-#[test]
-fn test_leader_transfer_timeout() {
+#[tokio::test]
+async fn test_leader_transfer_timeout() {
     let l = default_logger();
-    let mut nt = Network::new(vec![None, None, None], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![None, None, None], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     nt.isolate(3);
 
     // Transfer leadership to isolated node, wait for timeout.
-    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
     assert_eq!(nt.peers[&1].lead_transferee.unwrap(), 3);
     let heartbeat_timeout = nt.peers[&1].heartbeat_timeout();
     let election_timeout = nt.peers[&1].election_timeout();
     for _ in 0..heartbeat_timeout {
-        nt.peers.get_mut(&1).unwrap().tick();
+        nt.peers.get_mut(&1).unwrap().tick().await;
     }
     assert_eq!(nt.peers[&1].lead_transferee.unwrap(), 3);
     for _ in 0..election_timeout - heartbeat_timeout {
-        nt.peers.get_mut(&1).unwrap().tick();
+        nt.peers.get_mut(&1).unwrap().tick().await;
     }
 
     check_leader_transfer_state(&nt.peers[&1], StateRole::Leader, 1);
 }
 
-#[test]
-fn test_leader_transfer_ignore_proposal() {
+#[tokio::test]
+async fn test_leader_transfer_ignore_proposal() {
     let l = default_logger();
-    let mut nt = Network::new(vec![None, None, None], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![None, None, None], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     nt.isolate(3);
 
     // Transfer leadership to isolated node to let transfer pending, then send proposal.
-    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
     assert_eq!(nt.peers[&1].lead_transferee.unwrap(), 3);
 
-    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
     assert_eq!(
         nt.peers
             .get_mut(&1)
             .unwrap()
-            .step(new_message(1, 1, MessageType::MsgPropose, 1)),
+            .step(new_message(1, 1, MessageType::MsgPropose, 1))
+            .await,
         Err(Error::ProposalDropped),
         "should return drop proposal error while transferring"
     );
@@ -3568,16 +3724,18 @@ fn test_leader_transfer_ignore_proposal() {
     assert_eq!(nt.peers[&1].prs().get(1).unwrap().matched, 1);
 }
 
-#[test]
-fn test_leader_transfer_receive_higher_term_vote() {
+#[tokio::test]
+async fn test_leader_transfer_receive_higher_term_vote() {
     let l = default_logger();
-    let mut nt = Network::new(vec![None, None, None], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![None, None, None], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     nt.isolate(3);
 
     // Transfer leadership to isolated node to let transfer pending.
-    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
     assert_eq!(nt.peers[&1].lead_transferee.unwrap(), 3);
 
     nt.send(vec![new_message_with_entries(
@@ -3585,27 +3743,31 @@ fn test_leader_transfer_receive_higher_term_vote() {
         2,
         MessageType::MsgHup,
         vec![new_entry(1, 2, None)],
-    )]);
+    )])
+    .await;
 
     check_leader_transfer_state(&nt.peers[&1], StateRole::Follower, 2);
 }
 
-#[test]
-fn test_leader_transfer_remove_node() -> Result<()> {
+#[tokio::test]
+async fn test_leader_transfer_remove_node() -> Result<()> {
     let l = default_logger();
-    let mut nt = Network::new(vec![None, None, None], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![None, None, None], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     nt.ignore(MessageType::MsgTimeoutNow);
 
     // The lead_transferee is removed when leadship transferring.
-    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
     assert_eq!(nt.peers[&1].lead_transferee.unwrap(), 3);
 
     nt.peers
         .get_mut(&1)
         .unwrap()
-        .apply_conf_change(&remove_node(3))?;
+        .apply_conf_change(&remove_node(3))
+        .await?;
 
     check_leader_transfer_state(&nt.peers[&1], StateRole::Leader, 1);
 
@@ -3614,66 +3776,75 @@ fn test_leader_transfer_remove_node() -> Result<()> {
 
 // test_leader_transfer_back verifies leadership can transfer
 // back to self when last transfer is pending.
-#[test]
-fn test_leader_transfer_back() {
+#[tokio::test]
+async fn test_leader_transfer_back() {
     let l = default_logger();
-    let mut nt = Network::new(vec![None, None, None], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![None, None, None], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     nt.isolate(3);
 
-    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
     assert_eq!(nt.peers[&1].lead_transferee.unwrap(), 3);
 
     // Transfer leadership back to self.
-    nt.send(vec![new_message(1, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
 
     check_leader_transfer_state(&nt.peers[&1], StateRole::Leader, 1);
 }
 
 // test_leader_transfer_second_transfer_to_another_node verifies leader can transfer to another node
 // when last transfer is pending.
-#[test]
-fn test_leader_transfer_second_transfer_to_another_node() {
+#[tokio::test]
+async fn test_leader_transfer_second_transfer_to_another_node() {
     let l = default_logger();
-    let mut nt = Network::new(vec![None, None, None], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![None, None, None], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     nt.isolate(3);
 
-    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
     assert_eq!(nt.peers[&1].lead_transferee.unwrap(), 3);
 
     // Transfer leadership to another node.
-    nt.send(vec![new_message(2, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(2, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
 
     check_leader_transfer_state(&nt.peers[&1], StateRole::Follower, 2);
 }
 
 // test_leader_transfer_second_transfer_to_same_node verifies second transfer leader request
 // to the same node should not extend the timeout while the first one is pending.
-#[test]
-fn test_leader_transfer_second_transfer_to_same_node() {
+#[tokio::test]
+async fn test_leader_transfer_second_transfer_to_same_node() {
     let l = default_logger();
-    let mut nt = Network::new(vec![None, None, None], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![None, None, None], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     nt.isolate(3);
 
-    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
     assert_eq!(nt.peers[&1].lead_transferee.unwrap(), 3);
 
     let heartbeat_timeout = nt.peers[&1].heartbeat_timeout();
     for _ in 0..heartbeat_timeout {
-        nt.peers.get_mut(&1).unwrap().tick();
+        nt.peers.get_mut(&1).unwrap().tick().await;
     }
 
     // Second transfer leadership request to the same node.
-    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
 
     let election_timeout = nt.peers[&1].election_timeout();
     for _ in 0..election_timeout - heartbeat_timeout {
-        nt.peers.get_mut(&1).unwrap().tick();
+        nt.peers.get_mut(&1).unwrap().tick().await;
     }
 
     check_leader_transfer_state(&nt.peers[&1], StateRole::Leader, 1);
@@ -3693,16 +3864,19 @@ fn check_leader_transfer_state(r: &Raft<MemStorage>, state: StateRole, lead: u64
 // a node that has been removed from the group, nothing happens.
 // (previously, if the node also got votes, it would panic as it
 // transitioned to StateRole::Leader)
-#[test]
-fn test_transfer_non_member() {
+#[tokio::test]
+async fn test_transfer_non_member() {
     let l = default_logger();
-    let mut raft = new_test_raft(1, vec![2, 3, 4], 5, 1, new_storage(), &l);
+    let mut raft = new_test_raft(1, vec![2, 3, 4], 5, 1, new_storage(), &l).await;
     raft.step(new_message(2, 1, MessageType::MsgTimeoutNow, 0))
+        .await
         .expect("");
 
     raft.step(new_message(2, 1, MessageType::MsgRequestVoteResponse, 0))
+        .await
         .expect("");
     raft.step(new_message(3, 1, MessageType::MsgRequestVoteResponse, 0))
+        .await
         .expect("");
     assert_eq!(raft.state, StateRole::Follower);
 }
@@ -3712,33 +3886,36 @@ fn test_transfer_non_member() {
 // about the same time the leader node gets partitioned away.
 // Previously the cluster would come to a standstill when run with PreVote
 // enabled.
-#[test]
-fn test_node_with_smaller_term_can_complete_election() {
+#[tokio::test]
+async fn test_node_with_smaller_term_can_complete_election() {
     let l = default_logger();
-    let mut n1 = new_test_raft_with_prevote(1, vec![1, 2, 3], 10, 1, new_storage(), true, &l);
-    let mut n2 = new_test_raft_with_prevote(2, vec![1, 2, 3], 10, 1, new_storage(), true, &l);
-    let mut n3 = new_test_raft_with_prevote(3, vec![1, 2, 3], 10, 1, new_storage(), true, &l);
+    let mut n1 = new_test_raft_with_prevote(1, vec![1, 2, 3], 10, 1, new_storage(), true, &l).await;
+    let mut n2 = new_test_raft_with_prevote(2, vec![1, 2, 3], 10, 1, new_storage(), true, &l).await;
+    let mut n3 = new_test_raft_with_prevote(3, vec![1, 2, 3], 10, 1, new_storage(), true, &l).await;
 
-    n1.become_follower(1, INVALID_ID);
-    n2.become_follower(1, INVALID_ID);
-    n3.become_follower(1, INVALID_ID);
+    n1.become_follower(1, INVALID_ID).await;
+    n2.become_follower(1, INVALID_ID).await;
+    n3.become_follower(1, INVALID_ID).await;
 
     // cause a network partition to isolate node 3
     let mut config = Network::default_config();
     config.pre_vote = true;
-    let mut nt = Network::new_with_config(vec![Some(n1), Some(n2), Some(n3)], &config, &l);
+    let mut nt = Network::new_with_config(vec![Some(n1), Some(n2), Some(n3)], &config, &l).await;
     nt.cut(1, 3);
     nt.cut(2, 3);
 
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
     assert_eq!(nt.peers[&2].state, StateRole::Follower);
 
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
     assert_eq!(nt.peers[&3].state, StateRole::PreCandidate);
 
-    nt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)])
+        .await;
 
     // check whether the term values are expected
     // a.Term == 3
@@ -3763,8 +3940,10 @@ fn test_node_with_smaller_term_can_complete_election() {
     nt.cut(2, 3);
 
     // call for election
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     // do we have a leader?
     assert!(
@@ -3773,7 +3952,7 @@ fn test_node_with_smaller_term_can_complete_election() {
     );
 }
 
-pub fn new_test_learner_raft(
+pub async fn new_test_learner_raft(
     id: u64,
     peers: Vec<u64>,
     learners: Vec<u64>,
@@ -3782,17 +3961,17 @@ pub fn new_test_learner_raft(
     storage: MemStorage,
     logger: &Logger,
 ) -> Interface {
-    if storage.initial_state().unwrap().initialized() && peers.is_empty() {
+    if storage.initial_state().await.unwrap().initialized() && peers.is_empty() {
         panic!("new_test_raft with empty peers on initialized store");
     }
-    if !peers.is_empty() && !storage.initial_state().unwrap().initialized() {
-        storage.initialize_with_conf_state((peers, learners));
+    if !peers.is_empty() && !storage.initial_state().await.unwrap().initialized() {
+        storage.initialize_with_conf_state((peers, learners)).await;
     }
     let cfg = new_test_config(id, election, heartbeat);
-    new_test_raft_with_config(&cfg, storage, logger)
+    new_test_raft_with_config(&cfg, storage, logger).await
 }
 
-pub fn new_test_learner_raft_with_prevote(
+pub async fn new_test_learner_raft_with_prevote(
     id: u64,
     peers: Vec<u64>,
     learners: Vec<u64>,
@@ -3800,45 +3979,45 @@ pub fn new_test_learner_raft_with_prevote(
     prevote: bool,
 ) -> Interface {
     let storage = new_storage();
-    storage.initialize_with_conf_state((peers, learners));
+    storage.initialize_with_conf_state((peers, learners)).await;
     let mut cfg = new_test_config(id, 10, 1);
     cfg.pre_vote = prevote;
-    new_test_raft_with_config(&cfg, storage, logger)
+    new_test_raft_with_config(&cfg, storage, logger).await
 }
 
 // TestLearnerElectionTimeout verifies that the leader should not start election
 // even when times out.
-#[test]
-fn test_learner_election_timeout() {
+#[tokio::test]
+async fn test_learner_election_timeout() {
     let l = default_logger();
-    let mut n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage(), &l);
-    n1.become_follower(1, INVALID_ID);
+    let mut n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage(), &l).await;
+    n1.become_follower(1, INVALID_ID).await;
 
-    let mut n2 = new_test_learner_raft(2, vec![1], vec![2], 10, 1, new_storage(), &l);
-    n2.become_follower(1, INVALID_ID);
+    let mut n2 = new_test_learner_raft(2, vec![1], vec![2], 10, 1, new_storage(), &l).await;
+    n2.become_follower(1, INVALID_ID).await;
 
     let timeout = n2.election_timeout();
     n2.set_randomized_election_timeout(timeout);
 
     // n2 is a learner. Learner should not start election even when time out.
     for _ in 0..timeout {
-        n2.tick();
+        n2.tick().await;
     }
     assert_eq!(n2.state, StateRole::Follower);
 }
 
 // TestLearnerPromotion verifies that the leaner should not election until
 // it is promoted to a normal peer.
-#[test]
-fn test_learner_promotion() -> Result<()> {
+#[tokio::test]
+async fn test_learner_promotion() -> Result<()> {
     let l = default_logger();
-    let mut n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage(), &l);
-    n1.become_follower(1, INVALID_ID);
+    let mut n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage(), &l).await;
+    n1.become_follower(1, INVALID_ID).await;
 
-    let mut n2 = new_test_learner_raft(2, vec![1], vec![2], 10, 1, new_storage(), &l);
-    n2.become_follower(1, INVALID_ID);
+    let mut n2 = new_test_learner_raft(2, vec![1], vec![2], 10, 1, new_storage(), &l).await;
+    n2.become_follower(1, INVALID_ID).await;
 
-    let mut network = Network::new(vec![Some(n1), Some(n2)], &l);
+    let mut network = Network::new(vec![Some(n1), Some(n2)], &l).await;
     assert_eq!(network.peers[&1].state, StateRole::Follower);
 
     // n1 should become leader.
@@ -3849,25 +4028,27 @@ fn test_learner_promotion() -> Result<()> {
         .unwrap()
         .set_randomized_election_timeout(timeout);
     for _ in 0..timeout {
-        network.peers.get_mut(&1).unwrap().tick();
+        network.peers.get_mut(&1).unwrap().tick().await;
     }
     assert_eq!(network.peers[&1].state, StateRole::Leader);
     assert_eq!(network.peers[&2].state, StateRole::Follower);
 
     let mut heart_beat = new_message(1, 1, MessageType::MsgBeat, 0);
-    network.send(vec![heart_beat.clone()]);
+    network.send(vec![heart_beat.clone()]).await;
 
     // Promote n2 from learner to follower.
     network
         .peers
         .get_mut(&1)
         .unwrap()
-        .apply_conf_change(&add_node(2))?;
+        .apply_conf_change(&add_node(2))
+        .await?;
     network
         .peers
         .get_mut(&2)
         .unwrap()
-        .apply_conf_change(&add_node(2))?;
+        .apply_conf_change(&add_node(2))
+        .await?;
     assert_eq!(network.peers[&2].state, StateRole::Follower);
     assert!(network.peers[&2].promotable());
 
@@ -3878,12 +4059,12 @@ fn test_learner_promotion() -> Result<()> {
         .unwrap()
         .set_randomized_election_timeout(timeout);
     for _ in 0..timeout {
-        network.peers.get_mut(&2).unwrap().tick();
+        network.peers.get_mut(&2).unwrap().tick().await;
     }
 
     heart_beat.to = 2;
     heart_beat.from = 2;
-    network.send(vec![heart_beat]);
+    network.send(vec![heart_beat]).await;
     assert_eq!(network.peers[&1].state, StateRole::Follower);
     assert_eq!(network.peers[&2].state, StateRole::Leader);
 
@@ -3891,23 +4072,25 @@ fn test_learner_promotion() -> Result<()> {
 }
 
 // TestLearnerLogReplication tests that a learner can receive entries from the leader.
-#[test]
-fn test_learner_log_replication() {
+#[tokio::test]
+async fn test_learner_log_replication() {
     let l = default_logger();
-    let n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage(), &l);
-    let n2 = new_test_learner_raft(2, vec![1], vec![2], 10, 1, new_storage(), &l);
-    let mut network = Network::new(vec![Some(n1), Some(n2)], &l);
+    let n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage(), &l).await;
+    let n2 = new_test_learner_raft(2, vec![1], vec![2], 10, 1, new_storage(), &l).await;
+    let mut network = Network::new(vec![Some(n1), Some(n2)], &l).await;
 
     network
         .peers
         .get_mut(&1)
         .unwrap()
-        .become_follower(1, INVALID_ID);
+        .become_follower(1, INVALID_ID)
+        .await;
     network
         .peers
         .get_mut(&2)
         .unwrap()
-        .become_follower(1, INVALID_ID);
+        .become_follower(1, INVALID_ID)
+        .await;
 
     let timeout = network.peers[&1].election_timeout();
     network
@@ -3917,11 +4100,11 @@ fn test_learner_log_replication() {
         .set_randomized_election_timeout(timeout);
 
     for _ in 0..timeout {
-        network.peers.get_mut(&1).unwrap().tick();
+        network.peers.get_mut(&1).unwrap().tick().await;
     }
 
     let heart_beat = new_message(1, 1, MessageType::MsgBeat, 0);
-    network.send(vec![heart_beat]);
+    network.send(vec![heart_beat]).await;
 
     assert_eq!(network.peers[&1].state, StateRole::Leader);
     assert_eq!(network.peers[&2].state, StateRole::Follower);
@@ -3930,7 +4113,7 @@ fn test_learner_log_replication() {
     let next_committed = network.peers[&1].raft_log.committed + 1;
 
     let msg = new_message(1, 1, MessageType::MsgPropose, 1);
-    network.send(vec![msg]);
+    network.send(vec![msg]).await;
 
     assert_eq!(network.peers[&1].raft_log.committed, next_committed);
     assert_eq!(network.peers[&2].raft_log.committed, next_committed);
@@ -3947,8 +4130,8 @@ fn test_learner_log_replication() {
 }
 
 // TestRestoreWithLearner restores a snapshot which contains learners.
-#[test]
-fn test_restore_with_learner() {
+#[tokio::test]
+async fn test_restore_with_learner() {
     let l = default_logger();
     let mut s = new_snapshot(11, 11, vec![1, 2]);
     s.metadata
@@ -3960,11 +4143,11 @@ fn test_restore_with_learner() {
         .learners
         .push(3);
 
-    let mut sm = new_test_learner_raft(3, vec![1, 2], vec![3], 10, 1, new_storage(), &l);
+    let mut sm = new_test_learner_raft(3, vec![1, 2], vec![3], 10, 1, new_storage(), &l).await;
     assert!(!sm.promotable());
-    assert!(sm.restore(s.clone()));
-    assert_eq!(sm.raft_log.last_index(), 11);
-    assert_eq!(sm.raft_log.term(11).unwrap(), 11);
+    assert!(sm.restore(s.clone()).await);
+    assert_eq!(sm.raft_log.last_index().await, 11);
+    assert_eq!(sm.raft_log.term(11).await.unwrap(), 11);
     assert_iter_eq!(o sm.prs().conf().voters().ids(), vec![1, 2]);
     assert_iter_eq!(sm.prs().conf().learners(), vec![3]);
 
@@ -3979,12 +4162,12 @@ fn test_restore_with_learner() {
         assert!(sm.prs().conf().learners().contains(node));
     }
 
-    assert!(!sm.restore(s));
+    assert!(!sm.restore(s).await);
 }
 
 // Tests if outgoing voters can restore snapshot correctly.
-#[test]
-fn test_restore_with_voters_outgoing() {
+#[tokio::test]
+async fn test_restore_with_voters_outgoing() {
     let l = default_logger();
     // magic number
     let mut s = new_snapshot(11, 11, vec![2, 3, 4]);
@@ -3996,12 +4179,16 @@ fn test_restore_with_voters_outgoing() {
         .unwrap()
         .voters_outgoing = vec![1, 2, 3];
 
-    let mut sm = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l);
-    assert!(sm.restore(s.clone()));
-    assert_eq!(sm.raft_log.last_index(), s.metadata.as_ref().unwrap().index);
+    let mut sm = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l).await;
+    assert!(sm.restore(s.clone()).await);
+    assert_eq!(
+        sm.raft_log.last_index().await,
+        s.metadata.as_ref().unwrap().index
+    );
     assert_eq!(
         sm.raft_log
             .term(s.metadata.as_ref().unwrap().index)
+            .await
             .unwrap(),
         s.metadata.as_ref().unwrap().term
     );
@@ -4009,12 +4196,12 @@ fn test_restore_with_voters_outgoing() {
         o sm.prs().conf().voters().ids(),
         vec![1, 2, 3, 4]
     );
-    assert!(!sm.restore(s));
+    assert!(!sm.restore(s).await);
 }
 
 // Verifies that a voter can be depromoted by snapshot.
-#[test]
-fn test_restore_depromote_voter() {
+#[tokio::test]
+async fn test_restore_depromote_voter() {
     let l = default_logger();
     let mut s = new_snapshot(11, 11, vec![1, 2]);
     s.metadata
@@ -4026,13 +4213,13 @@ fn test_restore_depromote_voter() {
         .learners
         .push(3);
 
-    let mut sm = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l);
+    let mut sm = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
     assert!(sm.promotable());
-    assert!(sm.restore(s));
+    assert!(sm.restore(s).await);
 }
 
-#[test]
-fn test_restore_learner() {
+#[tokio::test]
+async fn test_restore_learner() {
     let l = default_logger();
     let mut s = new_snapshot(11, 11, vec![1, 2]);
     s.metadata
@@ -4044,27 +4231,27 @@ fn test_restore_learner() {
         .learners
         .push(3);
 
-    let mut sm = new_test_raft(3, vec![], 10, 1, new_storage(), &l);
+    let mut sm = new_test_raft(3, vec![], 10, 1, new_storage(), &l).await;
     assert!(!sm.promotable()); // Uninitialized peers can't be promoted.
-    assert!(sm.restore(s));
+    assert!(sm.restore(s).await);
     assert!(!sm.promotable());
 }
 
 // TestRestoreLearnerPromotion checks that a learner can become to a follower after
 // restoring snapshot.
-#[test]
-fn test_restore_learner_promotion() {
+#[tokio::test]
+async fn test_restore_learner_promotion() {
     let l = default_logger();
     let s = new_snapshot(11, 11, vec![1, 2, 3]);
-    let mut sm = new_test_learner_raft(3, vec![1, 2], vec![3], 10, 1, new_storage(), &l);
+    let mut sm = new_test_learner_raft(3, vec![1, 2], vec![3], 10, 1, new_storage(), &l).await;
     assert!(!sm.promotable());
-    assert!(sm.restore(s));
+    assert!(sm.restore(s).await);
     assert!(sm.promotable());
 }
 
 // TestLearnerReceiveSnapshot tests that a learner can receive a snapshot from leader.
-#[test]
-fn test_learner_receive_snapshot() {
+#[tokio::test]
+async fn test_learner_receive_snapshot() {
     let l = default_logger();
     let mut s = new_snapshot(11, 11, vec![1]);
     s.metadata
@@ -4076,16 +4263,16 @@ fn test_learner_receive_snapshot() {
         .learners
         .push(2);
 
-    let mut n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage(), &l);
-    let n2 = new_test_learner_raft(2, vec![1], vec![2], 10, 1, new_storage(), &l);
+    let mut n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage(), &l).await;
+    let n2 = new_test_learner_raft(2, vec![1], vec![2], 10, 1, new_storage(), &l).await;
 
-    n1.restore(s);
-    n1.persist();
+    n1.restore(s).await;
+    n1.persist().await;
 
     let committed = n1.raft_log.committed;
-    n1.commit_apply(committed);
+    n1.commit_apply(committed).await;
 
-    let mut network = Network::new(vec![Some(n1), Some(n2)], &l);
+    let mut network = Network::new(vec![Some(n1), Some(n2)], &l).await;
 
     let timeout = network.peers[&1].election_timeout();
     network
@@ -4095,14 +4282,14 @@ fn test_learner_receive_snapshot() {
         .set_randomized_election_timeout(timeout);
 
     for _ in 0..timeout {
-        network.peers.get_mut(&1).unwrap().tick();
+        network.peers.get_mut(&1).unwrap().tick().await;
     }
 
     let mut msg = Message::default();
     msg.from = 1;
     msg.to = 1;
     msg.set_msg_type(MessageType::MsgBeat);
-    network.send(vec![msg]);
+    network.send(vec![msg]).await;
 
     let n1_committed = network.peers[&1].raft_log.committed;
     let n2_committed = network.peers[&2].raft_log.committed;
@@ -4110,11 +4297,11 @@ fn test_learner_receive_snapshot() {
 }
 
 // TestAddLearner tests that addLearner could update nodes correctly.
-#[test]
-fn test_add_learner() -> Result<()> {
+#[tokio::test]
+async fn test_add_learner() -> Result<()> {
     let l = default_logger();
-    let mut n1 = new_test_raft(1, vec![1], 10, 1, new_storage(), &l);
-    n1.apply_conf_change(&add_learner(2))?;
+    let mut n1 = new_test_raft(1, vec![1], 10, 1, new_storage(), &l).await;
+    n1.apply_conf_change(&add_learner(2)).await?;
 
     assert_iter_eq!(n1.prs().conf().learners(), vec![2]);
     assert!(n1.prs().conf().learners().contains(&2));
@@ -4124,16 +4311,16 @@ fn test_add_learner() -> Result<()> {
 
 // TestRemoveLearner tests that removeNode could update nodes and
 // and removed list correctly.
-#[test]
-fn test_remove_learner() -> Result<()> {
+#[tokio::test]
+async fn test_remove_learner() -> Result<()> {
     let l = default_logger();
-    let mut n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage(), &l);
-    n1.apply_conf_change(&remove_node(2))?;
+    let mut n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage(), &l).await;
+    n1.apply_conf_change(&remove_node(2)).await?;
     assert_iter_eq!(o n1.prs().conf().voters().ids(), vec![1]);
     assert!(n1.prs().conf().learners().is_empty());
 
     // Remove all voters are not allowed.
-    assert!(n1.apply_conf_change(&remove_node(1)).is_err());
+    assert!(n1.apply_conf_change(&remove_node(1)).await.is_err());
     assert_iter_eq!(o n1.prs().conf().voters().ids(), vec![1]);
     assert!(n1.prs().conf().learners().is_empty());
 
@@ -4144,28 +4331,32 @@ fn test_remove_learner() -> Result<()> {
 // n1 is leader with term 2
 // n2 is follower with term 2
 // n3 is partitioned, with term 4 and less log, state is candidate
-fn new_prevote_migration_cluster(l: &Logger) -> Network {
+async fn new_prevote_migration_cluster(l: &Logger) -> Network {
     // We intentionally do not enable pre_vote for n3, this is done so in order
     // to simulate a rolling restart process where it's possible to have a mixed
     // version cluster with replicas with pre_vote enabled, and replicas without.
-    let mut n1 = new_test_raft_with_prevote(1, vec![1, 2, 3], 10, 1, new_storage(), true, l);
-    let mut n2 = new_test_raft_with_prevote(2, vec![1, 2, 3], 10, 1, new_storage(), true, l);
-    let mut n3 = new_test_raft_with_prevote(3, vec![1, 2, 3], 10, 1, new_storage(), false, l);
+    let mut n1 = new_test_raft_with_prevote(1, vec![1, 2, 3], 10, 1, new_storage(), true, l).await;
+    let mut n2 = new_test_raft_with_prevote(2, vec![1, 2, 3], 10, 1, new_storage(), true, l).await;
+    let mut n3 = new_test_raft_with_prevote(3, vec![1, 2, 3], 10, 1, new_storage(), false, l).await;
 
-    n1.become_follower(1, INVALID_ID);
-    n2.become_follower(1, INVALID_ID);
-    n3.become_follower(1, INVALID_ID);
+    n1.become_follower(1, INVALID_ID).await;
+    n2.become_follower(1, INVALID_ID).await;
+    n3.become_follower(1, INVALID_ID).await;
 
-    let mut nt = Network::new(vec![Some(n1), Some(n2), Some(n3)], l);
+    let mut nt = Network::new(vec![Some(n1), Some(n2), Some(n3)], l).await;
 
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     // Cause a network partition to isolate n3.
     nt.isolate(3);
-    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+        .await;
 
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
 
     // check state
     // n1.state == Leader
@@ -4190,20 +4381,22 @@ fn new_prevote_migration_cluster(l: &Logger) -> Network {
     nt
 }
 
-#[test]
-fn test_prevote_migration_can_complete_election() {
+#[tokio::test]
+async fn test_prevote_migration_can_complete_election() {
     let l = default_logger();
     // n1 is leader with term 2
     // n2 is follower with term 2
     // n3 is pre-candidate with term 4, and less log
-    let mut nt = new_prevote_migration_cluster(&l);
+    let mut nt = new_prevote_migration_cluster(&l).await;
 
     // simulate leader down
     nt.isolate(1);
 
     // Call for elections from both n2 and n3.
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
-    nt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
+    nt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)])
+        .await;
 
     // check state
     // n2.state == Follower
@@ -4211,8 +4404,10 @@ fn test_prevote_migration_can_complete_election() {
     assert_eq!(nt.peers[&2].state, StateRole::Follower);
     assert_eq!(nt.peers[&3].state, StateRole::PreCandidate);
 
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
-    nt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
+    nt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)])
+        .await;
 
     // Do we have a leader?
     assert!(
@@ -4220,29 +4415,31 @@ fn test_prevote_migration_can_complete_election() {
     );
 }
 
-#[test]
-fn test_prevote_migration_with_free_stuck_pre_candidate() {
+#[tokio::test]
+async fn test_prevote_migration_with_free_stuck_pre_candidate() {
     let l = default_logger();
-    let mut nt = new_prevote_migration_cluster(&l);
+    let mut nt = new_prevote_migration_cluster(&l).await;
 
     // n1 is leader with term 2
     // n2 is follower with term 2
     // n3 is pre-candidate with term 4, and less log
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
 
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
     assert_eq!(nt.peers[&2].state, StateRole::Follower);
     assert_eq!(nt.peers[&3].state, StateRole::PreCandidate);
 
     // Pre-Vote again for safety
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
     assert_eq!(nt.peers[&2].state, StateRole::Follower);
     assert_eq!(nt.peers[&3].state, StateRole::PreCandidate);
 
     let mut to_send = new_message(1, 3, MessageType::MsgHeartbeat, 0);
     to_send.term = nt.peers[&1].term;
-    nt.send(vec![to_send]);
+    nt.send(vec![to_send]).await;
 
     // Disrupt the leader so that the stuck peer is freed
     assert_eq!(nt.peers[&1].state, StateRole::Follower);
@@ -4250,27 +4447,27 @@ fn test_prevote_migration_with_free_stuck_pre_candidate() {
     assert_eq!(nt.peers[&3].term, nt.peers[&1].term);
 }
 
-#[test]
-fn test_learner_respond_vote() -> Result<()> {
+async fn do_campaign_test_learner_respond_vote(nw: &mut Network) {
+    let msg = new_message(1, 1, MessageType::MsgHup, 0);
+    nw.send(vec![msg]).await;
+}
+
+#[tokio::test]
+async fn test_learner_respond_vote() -> Result<()> {
     let l = default_logger();
-    let mut n1 = new_test_learner_raft(1, vec![1, 2], vec![3], 10, 1, new_storage(), &l);
-    n1.become_follower(1, INVALID_ID);
+    let mut n1 = new_test_learner_raft(1, vec![1, 2], vec![3], 10, 1, new_storage(), &l).await;
+    n1.become_follower(1, INVALID_ID).await;
     n1.reset_randomized_election_timeout();
 
-    let mut n3 = new_test_learner_raft(3, vec![1, 2], vec![3], 10, 1, new_storage(), &l);
-    n3.become_follower(1, INVALID_ID);
+    let mut n3 = new_test_learner_raft(3, vec![1, 2], vec![3], 10, 1, new_storage(), &l).await;
+    n3.become_follower(1, INVALID_ID).await;
     n3.reset_randomized_election_timeout();
 
-    let do_campaign = |nw: &mut Network| {
-        let msg = new_message(1, 1, MessageType::MsgHup, 0);
-        nw.send(vec![msg]);
-    };
-
-    let mut network = Network::new(vec![Some(n1), None, Some(n3)], &l);
+    let mut network = Network::new(vec![Some(n1), None, Some(n3)], &l).await;
     network.isolate(2);
 
     // Can't elect new leader because 1 won't send MsgRequestVote to 3.
-    do_campaign(&mut network);
+    do_campaign_test_learner_respond_vote(&mut network).await;
     assert_eq!(network.peers[&1].state, StateRole::Candidate);
 
     // After promote 3 to voter, election should success.
@@ -4278,19 +4475,20 @@ fn test_learner_respond_vote() -> Result<()> {
         .peers
         .get_mut(&1)
         .unwrap()
-        .apply_conf_change(&add_node(3))?;
-    do_campaign(&mut network);
+        .apply_conf_change(&add_node(3))
+        .await?;
+    do_campaign_test_learner_respond_vote(&mut network).await;
     assert_eq!(network.peers[&1].state, StateRole::Leader);
 
     Ok(())
 }
 
-#[test]
-fn test_election_tick_range() {
+#[tokio::test]
+async fn test_election_tick_range() {
     let l = default_logger();
     let mut cfg = new_test_config(1, 10, 1);
-    let s = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![]));
-    let mut raft = new_test_raft_with_config(&cfg, s, &l).raft.unwrap();
+    let s = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![])).await;
+    let mut raft = new_test_raft_with_config(&cfg, s, &l).await.raft.unwrap();
     for _ in 0..1000 {
         raft.reset_randomized_election_timeout();
         let randomized_timeout = raft.randomized_election_timeout();
@@ -4313,6 +4511,7 @@ fn test_election_tick_range() {
 
     cfg.max_election_tick = cfg.election_tick + 1;
     raft = new_test_raft_with_config(&cfg, new_storage(), &l)
+        .await
         .raft
         .unwrap();
     for _ in 0..100 {
@@ -4324,24 +4523,32 @@ fn test_election_tick_range() {
 
 // TestPreVoteWithSplitVote verifies that after split vote, cluster can complete
 // election in next round.
-#[test]
-fn test_prevote_with_split_vote() {
+#[tokio::test]
+async fn test_prevote_with_split_vote() {
     let l = default_logger();
-    let peers = (1..=3).map(|id| {
-        let mut raft =
-            new_test_raft_with_prevote(id, vec![1, 2, 3], 10, 1, new_storage(), true, &l);
-        raft.become_follower(1, INVALID_ID);
-        Some(raft)
-    });
-    let mut network = Network::new(peers.collect(), &l);
-    network.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let peers = {
+        let mut peers = vec![];
+        for id in 1..=3 {
+            let mut raft =
+                new_test_raft_with_prevote(id, vec![1, 2, 3], 10, 1, new_storage(), true, &l).await;
+            raft.become_follower(1, INVALID_ID).await;
+            peers.push(Some(raft))
+        }
+        peers
+    };
+    let mut network = Network::new(peers, &l).await;
+    network
+        .send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     // simulate leader down. followers start split vote.
     network.isolate(1);
-    network.send(vec![
-        new_message(2, 2, MessageType::MsgHup, 0),
-        new_message(3, 3, MessageType::MsgHup, 0),
-    ]);
+    network
+        .send(vec![
+            new_message(2, 2, MessageType::MsgHup, 0),
+            new_message(3, 3, MessageType::MsgHup, 0),
+        ])
+        .await;
 
     // check whether the term values are expected
     assert_eq!(network.peers[&2].term, 3, "peer 2 term",);
@@ -4360,7 +4567,9 @@ fn test_prevote_with_split_vote() {
     );
 
     // node 2 election timeout first
-    network.send(vec![new_message(2, 2, MessageType::MsgHup, 0)]);
+    network
+        .send(vec![new_message(2, 2, MessageType::MsgHup, 0)])
+        .await;
 
     // check whether the term values are expected
     assert_eq!(network.peers[&2].term, 4, "peer 2 term",);
@@ -4371,23 +4580,30 @@ fn test_prevote_with_split_vote() {
     assert_eq!(network.peers[&3].state, StateRole::Follower, "peer 3 state",);
 }
 
-// ensure that after a node become pre-candidate, it will checkQuorum correctly.
-#[test]
-fn test_prevote_with_check_quorum() {
-    let l = default_logger();
-    let bootstrap = |id| {
-        let mut cfg = new_test_config(id, 10, 1);
-        cfg.pre_vote = true;
-        cfg.check_quorum = true;
-        let s = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![]));
-        let mut i = new_test_raft_with_config(&cfg, s, &l);
-        i.become_follower(1, INVALID_ID);
-        i
-    };
-    let (peer1, peer2, peer3) = (bootstrap(1), bootstrap(2), bootstrap(3));
+async fn bootstrap_test_prevote_with_check_quorum(id: u64, l: &slog::Logger) -> Interface {
+    let mut cfg = new_test_config(id, 10, 1);
+    cfg.pre_vote = true;
+    cfg.check_quorum = true;
+    let s = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![])).await;
+    let mut i = new_test_raft_with_config(&cfg, s, l).await;
+    i.become_follower(1, INVALID_ID).await;
+    i
+}
 
-    let mut network = Network::new(vec![Some(peer1), Some(peer2), Some(peer3)], &l);
-    network.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+// ensure that after a node become pre-candidate, it will checkQuorum correctly.
+#[tokio::test]
+async fn test_prevote_with_check_quorum() {
+    let l = default_logger();
+    let (peer1, peer2, peer3) = (
+        bootstrap_test_prevote_with_check_quorum(1, &l).await,
+        bootstrap_test_prevote_with_check_quorum(2, &l).await,
+        bootstrap_test_prevote_with_check_quorum(3, &l).await,
+    );
+
+    let mut network = Network::new(vec![Some(peer1), Some(peer2), Some(peer3)], &l).await;
+    network
+        .send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     // cause a network partition to isolate node 3. node 3 has leader info
     network.cut(1, 3);
@@ -4396,7 +4612,9 @@ fn test_prevote_with_check_quorum() {
     assert_eq!(network.peers[&1].state, StateRole::Leader, "peer 1 state",);
     assert_eq!(network.peers[&2].state, StateRole::Follower, "peer 2 state",);
 
-    network.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+    network
+        .send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
 
     assert_eq!(
         network.peers[&3].state,
@@ -4405,8 +4623,12 @@ fn test_prevote_with_check_quorum() {
     );
 
     // term + 2, so that node 2 will ignore node 3's PreVote
-    network.send(vec![new_message(2, 1, MessageType::MsgTransferLeader, 0)]);
-    network.send(vec![new_message(1, 2, MessageType::MsgTransferLeader, 0)]);
+    network
+        .send(vec![new_message(2, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
+    network
+        .send(vec![new_message(1, 2, MessageType::MsgTransferLeader, 0)])
+        .await;
 
     // check whether the term values are expected
     assert_eq!(network.peers[&1].term, 4, "peer 1 term",);
@@ -4431,9 +4653,11 @@ fn test_prevote_with_check_quorum() {
     // call for election. node 3 shouldn't ignore node 2's PreVote
     let timeout = network.peers[&3].randomized_election_timeout();
     for _ in 0..timeout {
-        network.peers.get_mut(&3).unwrap().tick();
+        network.peers.get_mut(&3).unwrap().tick().await;
     }
-    network.send(vec![new_message(2, 2, MessageType::MsgHup, 0)]);
+    network
+        .send(vec![new_message(2, 2, MessageType::MsgHup, 0)])
+        .await;
 
     // check state
     assert_eq!(network.peers[&2].state, StateRole::Leader, "peer 2 state",);
@@ -4441,27 +4665,27 @@ fn test_prevote_with_check_quorum() {
 }
 
 // ensure a new Raft returns a Error::ConfigInvalid with an invalid config
-#[test]
-fn test_new_raft_with_bad_config_errors() {
+#[tokio::test]
+async fn test_new_raft_with_bad_config_errors() {
     let invalid_config = new_test_config(INVALID_ID, 1, 1);
-    let s = MemStorage::new_with_conf_state((vec![1, 2], vec![]));
-    let raft = Raft::new(&invalid_config, s, &default_logger());
+    let s = MemStorage::new_with_conf_state((vec![1, 2], vec![])).await;
+    let raft = Raft::new(&invalid_config, s, &default_logger()).await;
     assert!(raft.is_err())
 }
 
 // tests whether MsgAppend are batched
-#[test]
-fn test_batch_msg_append() {
+#[tokio::test]
+async fn test_batch_msg_append() {
     let l = default_logger();
     let storage = new_storage();
-    let mut raft = new_test_raft(1, vec![1, 2, 3], 10, 1, storage.clone(), &l);
-    raft.become_candidate();
-    raft.become_leader();
+    let mut raft = new_test_raft(1, vec![1, 2, 3], 10, 1, storage.clone(), &l).await;
+    raft.become_candidate().await;
+    raft.become_leader().await;
     raft.set_batch_append(true);
-    commit_noop_entry(&mut raft, &storage);
+    commit_noop_entry(&mut raft, &storage).await;
     for _ in 0..10 {
         let prop_msg = new_message(1, 1, MessageType::MsgPropose, 1);
-        raft.step(prop_msg).unwrap();
+        raft.step(prop_msg).await.unwrap();
     }
     assert_eq!(raft.msgs.len(), 2);
     for msg in &raft.msgs {
@@ -4472,16 +4696,17 @@ fn test_batch_msg_append() {
     let mut reject_msg = new_message(2, 1, MessageType::MsgAppendResponse, 0);
     reject_msg.reject = true;
     reject_msg.index = 2;
-    raft.step(reject_msg).unwrap();
+    raft.step(reject_msg).await.unwrap();
     assert_eq!(raft.msgs.len(), 3);
 }
 
 /// Tests if unapplied conf change is checked before campaign.
-#[test]
-fn test_conf_change_check_before_campaign() {
+#[tokio::test]
+async fn test_conf_change_check_before_campaign() {
     let l = default_logger();
-    let mut nt = Network::new(vec![None, None, None], &l);
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    let mut nt = Network::new(vec![None, None, None], &l).await;
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
 
     let mut m = new_message(1, 1, MessageType::MsgPropose, 0);
@@ -4492,7 +4717,7 @@ fn test_conf_change_check_before_campaign() {
     cc.node_id = 3;
     e.data = cc.encode_to_vec();
     m.entries.push(e);
-    nt.send(vec![m]);
+    nt.send(vec![m]).await;
 
     // trigger campaign in node 2
     nt.peers
@@ -4501,13 +4726,14 @@ fn test_conf_change_check_before_campaign() {
         .reset_randomized_election_timeout();
     let timeout = nt.peers[&2].randomized_election_timeout();
     for _ in 0..timeout {
-        nt.peers.get_mut(&2).unwrap().tick();
+        nt.peers.get_mut(&2).unwrap().tick().await;
     }
     // It's still follower because committed conf change is not applied.
     assert_eq!(nt.peers[&2].state, StateRole::Follower);
 
     // Transfer leadership to peer 2.
-    nt.send(vec![new_message(2, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(2, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
     assert_eq!(nt.peers[&1].state, StateRole::Leader);
     // It's still follower because committed conf change is not applied.
     assert_eq!(nt.peers[&2].state, StateRole::Follower);
@@ -4515,23 +4741,26 @@ fn test_conf_change_check_before_campaign() {
     nt.peers.get_mut(&1).unwrap().abort_leader_transfer();
 
     let committed = nt.peers[&2].raft_log.committed;
-    nt.peers.get_mut(&2).unwrap().commit_apply(committed);
+    nt.peers.get_mut(&2).unwrap().commit_apply(committed).await;
     nt.peers
         .get_mut(&2)
         .unwrap()
         .apply_conf_change(&remove_node(3))
+        .await
         .unwrap();
 
     // transfer leadership to peer 2 again.
-    nt.send(vec![new_message(2, 1, MessageType::MsgTransferLeader, 0)]);
+    nt.send(vec![new_message(2, 1, MessageType::MsgTransferLeader, 0)])
+        .await;
     assert_eq!(nt.peers[&1].state, StateRole::Follower);
     assert_eq!(nt.peers[&2].state, StateRole::Leader);
 
-    nt.peers.get_mut(&1).unwrap().commit_apply(committed);
+    nt.peers.get_mut(&1).unwrap().commit_apply(committed).await;
     nt.peers
         .get_mut(&1)
         .unwrap()
         .apply_conf_change(&remove_node(3))
+        .await
         .unwrap();
 
     // trigger campaign in node 1
@@ -4541,12 +4770,12 @@ fn test_conf_change_check_before_campaign() {
         .reset_randomized_election_timeout();
     let timeout = nt.peers[&1].randomized_election_timeout();
     for _ in 0..timeout {
-        nt.peers.get_mut(&1).unwrap().tick();
+        nt.peers.get_mut(&1).unwrap().tick().await;
     }
     assert_eq!(nt.peers[&1].state, StateRole::Candidate);
 }
 
-fn test_advance_commit_index_by_vote_request(use_prevote: bool) {
+async fn test_advance_commit_index_by_vote_request(use_prevote: bool) {
     let l = default_logger();
     let mut cases: Vec<Box<dyn ConfChangeI>> = vec![
         Box::new(conf_change(ConfChangeType::AddNode, 4)),
@@ -4556,19 +4785,16 @@ fn test_advance_commit_index_by_vote_request(use_prevote: bool) {
         ])),
     ];
     for (i, cc) in cases.drain(..).enumerate() {
-        let peers = (1..=4)
-            .map(|id| {
-                Some(new_test_learner_raft_with_prevote(
-                    id,
-                    vec![1, 2, 3],
-                    vec![4],
-                    &l,
-                    use_prevote,
-                ))
-            })
-            .collect();
-        let mut nt = Network::new(peers, &l);
-        nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+        let mut peers = vec![];
+        for id in 1..=4 {
+            peers.push(Some(
+                new_test_learner_raft_with_prevote(id, vec![1, 2, 3], vec![4], &l, use_prevote)
+                    .await,
+            ));
+        }
+        let mut nt = Network::new(peers, &l).await;
+        nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+            .await;
         let mut e = Entry::default();
         if let Some(v1) = cc.as_v1() {
             e.set_entry_type(EntryType::EntryConfChange);
@@ -4585,22 +4811,25 @@ fn test_advance_commit_index_by_vote_request(use_prevote: bool) {
             1,
             MessageType::MsgPropose,
             vec![e],
-        )]);
-        let cc_index = nt.peers[&1].raft_log.last_index();
+        )])
+        .await;
+        let cc_index = nt.peers[&1].raft_log.last_index().await;
 
         // let node 4 have more up to data log than other voter
         nt.recover();
         nt.cut(1, 2);
         nt.cut(1, 3);
-        nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
+        nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+            .await;
 
         // let the confchange entry commit but don't let node 4 know
         nt.recover();
         nt.cut(1, 4);
         nt.ignore(MessageType::MsgAppend);
         let mut msg = new_message(2, 1, MessageType::MsgAppendResponse, 0);
-        msg.index = nt.peers[&2].raft_log.last_index();
-        nt.send(vec![msg, new_message(1, 1, MessageType::MsgBeat, 0)]);
+        msg.index = nt.peers[&2].raft_log.last_index().await;
+        nt.send(vec![msg, new_message(1, 1, MessageType::MsgBeat, 0)])
+            .await;
 
         // simulate the leader down
         nt.recover();
@@ -4615,7 +4844,7 @@ fn test_advance_commit_index_by_vote_request(use_prevote: bool) {
         }
         // node 4 can't start new election because it thinks itself is a learner
         for _ in 0..p4.randomized_election_timeout() {
-            p4.tick();
+            p4.tick().await;
         }
         if p4.state != StateRole::Follower {
             panic!("#{} node 4 state: {:?}, want Follower", i, p4.state);
@@ -4627,12 +4856,12 @@ fn test_advance_commit_index_by_vote_request(use_prevote: bool) {
                 i, cc_index, p2.raft_log.committed
             );
         }
-        p2.apply_conf_change(&cc.as_v2()).unwrap();
-        p2.commit_apply(cc_index);
+        p2.apply_conf_change(&cc.as_v2()).await.unwrap();
+        p2.commit_apply(cc_index).await;
 
         // node 2 needs votes from both node 3 and node 4, but node 4 will reject it
         for _ in 0..p2.randomized_election_timeout() {
-            p2.tick();
+            p2.tick().await;
         }
         let want = if use_prevote {
             StateRole::PreCandidate
@@ -4643,7 +4872,7 @@ fn test_advance_commit_index_by_vote_request(use_prevote: bool) {
             panic!("#{} node 2 state: {:?}, want {:?}", i, p2.state, want);
         }
         let msgs = nt.read_messages();
-        nt.filter_and_send(msgs);
+        nt.filter_and_send(msgs).await;
         if nt.peers[&2].state == StateRole::Leader {
             panic!("#{} node 2 can't campaign successfully.", i);
         }
@@ -4656,15 +4885,15 @@ fn test_advance_commit_index_by_vote_request(use_prevote: bool) {
                 i, cc_index, p4.raft_log.committed
             );
         }
-        p4.apply_conf_change(&cc.as_v2()).unwrap();
-        p4.commit_apply(cc_index);
+        p4.apply_conf_change(&cc.as_v2()).await.unwrap();
+        p4.commit_apply(cc_index).await;
 
         // now node 4 can start new election and become leader
         for _ in 0..p4.randomized_election_timeout() {
-            p4.tick();
+            p4.tick().await;
         }
         let msgs = nt.read_messages();
-        nt.filter_and_send(msgs);
+        nt.filter_and_send(msgs).await;
         if nt.peers[&4].state != StateRole::Leader {
             panic!("#{} node 4 state: {:?} want Leader", i, nt.peers[&4].state);
         }
@@ -4672,18 +4901,18 @@ fn test_advance_commit_index_by_vote_request(use_prevote: bool) {
 }
 
 /// Tests the commit index can be advanced by direct vote request
-#[test]
-fn test_advance_commit_index_by_direct_vote_request() {
-    test_advance_commit_index_by_vote_request(false)
+#[tokio::test]
+async fn test_advance_commit_index_by_direct_vote_request() {
+    test_advance_commit_index_by_vote_request(false).await
 }
 
 /// Tests the commit index can be advanced by prevote request
-#[test]
-fn test_advance_commit_index_by_prevote_request() {
-    test_advance_commit_index_by_vote_request(true)
+#[tokio::test]
+async fn test_advance_commit_index_by_prevote_request() {
+    test_advance_commit_index_by_vote_request(true).await
 }
 
-fn test_advance_commit_index_by_vote_response(use_prevote: bool) {
+async fn test_advance_commit_index_by_vote_response(use_prevote: bool) {
     let l = default_logger();
     let mut cases: Vec<Box<dyn ConfChangeI>> = vec![
         Box::new(conf_change(ConfChangeType::RemoveNode, 4)),
@@ -4697,9 +4926,10 @@ fn test_advance_commit_index_by_vote_response(use_prevote: bool) {
     ]);
     enter_joint.set_transition(ConfChangeTransition::Explicit);
     for (i, cc) in cases.drain(..).enumerate() {
-        let peers = (1..=4)
-            .map(|id| {
-                Some(new_test_raft_with_prevote(
+        let mut peers = vec![];
+        for id in 1..=4 {
+            peers.push(Some(
+                new_test_raft_with_prevote(
                     id,
                     vec![1, 2, 3, 4],
                     10,
@@ -4707,19 +4937,21 @@ fn test_advance_commit_index_by_vote_response(use_prevote: bool) {
                     new_storage(),
                     use_prevote,
                     &l,
-                ))
-            })
-            .collect();
-        let mut nt = Network::new(peers, &l);
+                )
+                .await,
+            ));
+        }
+        let mut nt = Network::new(peers, &l).await;
 
         // Joint confchange, let's enter joint first
         if cc.as_v1().is_none() {
             for p in nt.peers.values_mut() {
-                p.apply_conf_change(&enter_joint).unwrap();
+                p.apply_conf_change(&enter_joint).await.unwrap();
             }
         }
 
-        nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+        nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+            .await;
 
         let mut e = Entry::default();
         if let Some(v1) = cc.as_v1() {
@@ -4737,19 +4969,22 @@ fn test_advance_commit_index_by_vote_response(use_prevote: bool) {
             1,
             MessageType::MsgPropose,
             vec![e],
-        )]);
-        let cc_index = nt.peers[&1].raft_log.last_index();
+        )])
+        .await;
+        let cc_index = nt.peers[&1].raft_log.last_index().await;
 
         // let node 4 have more up to data log than other voter
         nt.recover();
         nt.cut(1, 2);
         nt.cut(1, 3);
-        nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
+        nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)])
+            .await;
 
         // A delayed MsgAppResp message make the confchange entry become committed
         let mut msg = new_message(2, 1, MessageType::MsgAppendResponse, 0);
-        msg.index = nt.peers[&2].raft_log.last_index();
-        nt.send(vec![msg, new_message(1, 1, MessageType::MsgBeat, 0)]);
+        msg.index = nt.peers[&2].raft_log.last_index().await;
+        nt.send(vec![msg, new_message(1, 1, MessageType::MsgBeat, 0)])
+            .await;
 
         // simulate the leader down
         nt.recover();
@@ -4762,11 +4997,11 @@ fn test_advance_commit_index_by_vote_response(use_prevote: bool) {
                 i, cc_index, p4.raft_log.committed
             );
         }
-        p4.apply_conf_change(&cc.as_v2()).unwrap();
-        p4.commit_apply(cc_index);
+        p4.apply_conf_change(&cc.as_v2()).await.unwrap();
+        p4.commit_apply(cc_index).await;
         // node 4 can't start new election because it thinks itself is a learner
         for _ in 0..p4.randomized_election_timeout() {
-            p4.tick();
+            p4.tick().await;
         }
         if p4.state != StateRole::Follower {
             panic!("#{} node 4 state: {:?}, want Follower", i, p4.state);
@@ -4781,7 +5016,7 @@ fn test_advance_commit_index_by_vote_response(use_prevote: bool) {
 
         // node 2 needs votes from both node 3 and node 4, but node 4 will reject it
         for _ in 0..p2.randomized_election_timeout() {
-            p2.tick();
+            p2.tick().await;
         }
         let want = if use_prevote {
             StateRole::PreCandidate
@@ -4792,7 +5027,7 @@ fn test_advance_commit_index_by_vote_response(use_prevote: bool) {
             panic!("#{} node 2 state: {:?}, want {:?}", i, p2.state, want);
         }
         let msgs = nt.read_messages();
-        nt.filter_and_send(msgs);
+        nt.filter_and_send(msgs).await;
         let p2 = nt.peers.get_mut(&2).unwrap();
         if p2.state != StateRole::Follower {
             panic!(
@@ -4808,15 +5043,15 @@ fn test_advance_commit_index_by_vote_response(use_prevote: bool) {
                 i, cc_index, p2.raft_log.committed
             );
         }
-        p2.apply_conf_change(&cc.as_v2()).unwrap();
-        p2.commit_apply(cc_index);
+        p2.apply_conf_change(&cc.as_v2()).await.unwrap();
+        p2.commit_apply(cc_index).await;
 
         // now node 2 only need vote from node 3
         for _ in 0..p2.randomized_election_timeout() {
-            p2.tick();
+            p2.tick().await;
         }
         let msgs = nt.read_messages();
-        nt.filter_and_send(msgs);
+        nt.filter_and_send(msgs).await;
         if nt.peers[&2].state != StateRole::Leader {
             panic!("#{} node 2 state: {:?} want Leader", i, nt.peers[&2].state);
         }
@@ -4824,47 +5059,49 @@ fn test_advance_commit_index_by_vote_response(use_prevote: bool) {
 }
 
 // Tests the commit index can be forwarded by direct vote response
-#[test]
-fn test_advance_commit_index_by_direct_vote_response() {
-    test_advance_commit_index_by_vote_response(false)
+#[tokio::test]
+async fn test_advance_commit_index_by_direct_vote_response() {
+    test_advance_commit_index_by_vote_response(false).await
 }
 
 // Tests the commit index can be forwarded by prevote response
-#[test]
-fn test_advance_commit_index_by_prevote_response() {
-    test_advance_commit_index_by_vote_response(true)
+#[tokio::test]
+async fn test_advance_commit_index_by_prevote_response() {
+    test_advance_commit_index_by_vote_response(true).await
 }
 
-fn prepare_request_snapshot() -> (Network, Snapshot) {
+async fn prepare_request_snapshot() -> (Network, Snapshot) {
     let l = default_logger();
 
-    fn index_term_11(id: u64, ids: Vec<u64>, l: &Logger) -> Interface {
+    async fn index_term_11(id: u64, ids: Vec<u64>, l: &Logger) -> Interface {
         let store = MemStorage::new();
         store
             .wl()
             .apply_snapshot(new_snapshot(11, 11, ids.clone()))
             .unwrap();
-        let mut raft = new_test_raft(id, ids, 5, 1, store, l);
-        raft.reset(11);
+        let mut raft = new_test_raft(id, ids, 5, 1, store, l).await;
+        raft.reset(11).await;
         raft
     }
 
     let mut nt = Network::new(
         vec![
-            Some(index_term_11(1, vec![1, 2, 3], &l)),
-            Some(index_term_11(2, vec![1, 2, 3], &l)),
-            Some(index_term_11(3, vec![1, 2, 3], &l)),
+            Some(index_term_11(1, vec![1, 2, 3], &l).await),
+            Some(index_term_11(2, vec![1, 2, 3], &l).await),
+            Some(index_term_11(3, vec![1, 2, 3], &l).await),
         ],
         &l,
-    );
+    )
+    .await;
 
     // elect r1 as leader
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     let mut test_entries = Entry::default();
     test_entries.data = (b"testdata" as &'static [u8]).into();
     let msg = new_message_with_entries(1, 1, MessageType::MsgPropose, vec![test_entries]);
-    nt.send(vec![msg.clone(), msg]);
+    nt.send(vec![msg.clone(), msg]).await;
     assert_eq!(nt.peers[&1].raft_log.committed, 14);
     assert_eq!(nt.peers[&2].raft_log.committed, 14);
 
@@ -4883,16 +5120,16 @@ fn prepare_request_snapshot() -> (Network, Snapshot) {
     let mut test_entries = Entry::default();
     test_entries.data = (b"testdata" as &'static [u8]).into();
     let msg = new_message_with_entries(1, 1, MessageType::MsgPropose, vec![test_entries]);
-    nt.send(vec![msg]);
+    nt.send(vec![msg]).await;
 
-    let s = nt.storage[&1].snapshot(0, 0).unwrap();
+    let s = nt.storage[&1].snapshot(0, 0).await.unwrap();
     (nt, s)
 }
 
 // Test if an up-to-date follower can request a snapshot from leader.
-#[test]
-fn test_follower_request_snapshot() {
-    let (mut nt, s) = prepare_request_snapshot();
+#[tokio::test]
+async fn test_follower_request_snapshot() {
+    let (mut nt, s) = prepare_request_snapshot().await;
 
     // Request the latest snapshot.
     let prev_snapshot_idx = s.metadata.as_ref().unwrap().index;
@@ -4902,6 +5139,7 @@ fn test_follower_request_snapshot() {
         .get_mut(&2)
         .unwrap()
         .request_snapshot(request_idx)
+        .await
         .unwrap();
 
     // Send the request snapshot message.
@@ -4913,13 +5151,13 @@ fn test_follower_request_snapshot() {
         "{:?}",
         req_snap
     );
-    nt.peers.get_mut(&1).unwrap().step(req_snap).unwrap();
+    nt.peers.get_mut(&1).unwrap().step(req_snap).await.unwrap();
 
     // New proposes can not be replicated to peer 2.
     let mut test_entries = Entry::default();
     test_entries.data = (b"testdata" as &'static [u8]).into();
     let msg = new_message_with_entries(1, 1, MessageType::MsgPropose, vec![test_entries]);
-    nt.send(vec![msg.clone()]);
+    nt.send(vec![msg.clone()]).await;
     assert_eq!(nt.peers[&1].raft_log.committed, 16);
     assert_eq!(
         nt.peers[&1].prs().get(2).unwrap().state,
@@ -4929,19 +5167,19 @@ fn test_follower_request_snapshot() {
 
     // Util snapshot success or fail.
     let report_ok = new_message(2, 1, MessageType::MsgSnapStatus, 0);
-    nt.send(vec![report_ok]);
+    nt.send(vec![report_ok]).await;
     let hb_resp = new_message(2, 1, MessageType::MsgHeartbeatResponse, 0);
-    nt.send(vec![hb_resp]);
-    nt.send(vec![msg]);
+    nt.send(vec![hb_resp]).await;
+    nt.send(vec![msg]).await;
 
     assert_eq!(nt.peers[&1].raft_log.committed, 17);
     assert_eq!(nt.peers[&2].raft_log.committed, 17);
 }
 
 // Test if request snapshot can make progress when it meets SnapshotTemporarilyUnavailable.
-#[test]
-fn test_request_snapshot_unavailable() {
-    let (mut nt, s) = prepare_request_snapshot();
+#[tokio::test]
+async fn test_request_snapshot_unavailable() {
+    let (mut nt, s) = prepare_request_snapshot().await;
 
     // Request the latest snapshot.
     let prev_snapshot_idx = s.metadata.as_ref().unwrap().index;
@@ -4951,6 +5189,7 @@ fn test_request_snapshot_unavailable() {
         .get_mut(&2)
         .unwrap()
         .request_snapshot(request_idx)
+        .await
         .unwrap();
 
     // Send the request snapshot message.
@@ -4969,6 +5208,7 @@ fn test_request_snapshot_unavailable() {
         .get_mut(&1)
         .unwrap()
         .step(req_snap.clone())
+        .await
         .unwrap();
     assert_eq!(
         nt.peers[&1].prs().get(2).unwrap().state,
@@ -4981,6 +5221,7 @@ fn test_request_snapshot_unavailable() {
         .get_mut(&1)
         .unwrap()
         .step(req_snap.clone())
+        .await
         .unwrap();
     assert_eq!(
         nt.peers[&1].prs().get(2).unwrap().state,
@@ -4989,7 +5230,7 @@ fn test_request_snapshot_unavailable() {
 
     // Snapshot will be available if it requests again. This message must not
     // be considered stale even if `reject != next - 1`
-    nt.peers.get_mut(&1).unwrap().step(req_snap).unwrap();
+    nt.peers.get_mut(&1).unwrap().step(req_snap).await.unwrap();
     assert_eq!(
         nt.peers[&1].prs().get(2).unwrap().state,
         ProgressState::Snapshot
@@ -4997,9 +5238,9 @@ fn test_request_snapshot_unavailable() {
 }
 
 // Test if request snapshot can make progress when matched is advanced.
-#[test]
-fn test_request_snapshot_matched_change() {
-    let (mut nt, _) = prepare_request_snapshot();
+#[tokio::test]
+async fn test_request_snapshot_matched_change() {
+    let (mut nt, _) = prepare_request_snapshot().await;
     // Let matched be greater than the committed.
     nt.peers.get_mut(&2).unwrap().raft_log.committed -= 1;
 
@@ -5009,10 +5250,11 @@ fn test_request_snapshot_matched_change() {
         .get_mut(&2)
         .unwrap()
         .request_snapshot(request_idx)
+        .await
         .unwrap();
     let req_snap = nt.peers.get_mut(&2).unwrap().msgs.pop().unwrap();
     // The request snapshot is ignored because it is considered as out of order.
-    nt.peers.get_mut(&1).unwrap().step(req_snap).unwrap();
+    nt.peers.get_mut(&1).unwrap().step(req_snap).await.unwrap();
     assert_eq!(
         nt.peers[&1].prs().get(2).unwrap().state,
         ProgressState::Replicate
@@ -5020,7 +5262,7 @@ fn test_request_snapshot_matched_change() {
 
     // Heartbeat is responded with a request snapshot message.
     for _ in 0..nt.peers[&1].heartbeat_timeout() {
-        nt.peers.get_mut(&1).unwrap().tick();
+        nt.peers.get_mut(&1).unwrap().tick().await;
     }
     let msg_hb = nt
         .peers
@@ -5031,9 +5273,9 @@ fn test_request_snapshot_matched_change() {
         .filter(|m| m.to == 2)
         .collect::<Vec<_>>()[0]
         .clone();
-    nt.peers.get_mut(&2).unwrap().step(msg_hb).unwrap();
+    nt.peers.get_mut(&2).unwrap().step(msg_hb).await.unwrap();
     let req_snap = nt.peers.get_mut(&2).unwrap().msgs.pop().unwrap();
-    nt.peers.get_mut(&1).unwrap().step(req_snap).unwrap();
+    nt.peers.get_mut(&1).unwrap().step(req_snap).await.unwrap();
     assert_eq!(
         nt.peers[&1].prs().get(2).unwrap().state,
         ProgressState::Snapshot
@@ -5041,9 +5283,9 @@ fn test_request_snapshot_matched_change() {
 }
 
 // Test if request snapshot can make progress when the peer is not Replicate.
-#[test]
-fn test_request_snapshot_none_replicate() {
-    let (mut nt, _) = prepare_request_snapshot();
+#[tokio::test]
+async fn test_request_snapshot_none_replicate() {
+    let (mut nt, _) = prepare_request_snapshot().await;
     nt.peers
         .get_mut(&1)
         .unwrap()
@@ -5058,24 +5300,26 @@ fn test_request_snapshot_none_replicate() {
         .get_mut(&2)
         .unwrap()
         .request_snapshot(request_idx)
+        .await
         .unwrap();
     let req_snap = nt.peers.get_mut(&2).unwrap().msgs.pop().unwrap();
-    nt.peers.get_mut(&1).unwrap().step(req_snap).unwrap();
+    nt.peers.get_mut(&1).unwrap().step(req_snap).await.unwrap();
     assert!(nt.peers[&1].prs().get(2).unwrap().pending_request_snapshot != 0);
 }
 
 // Test if request snapshot can make progress when leader steps down.
-#[test]
-fn test_request_snapshot_step_down() {
-    let (mut nt, _) = prepare_request_snapshot();
+#[tokio::test]
+async fn test_request_snapshot_step_down() {
+    let (mut nt, _) = prepare_request_snapshot().await;
 
     // Commit a new entry and leader steps down while peer 2 is isolated.
     nt.isolate(2);
     let mut test_entries = Entry::default();
     test_entries.data = (b"testdata" as &'static [u8]).into();
     let msg = new_message_with_entries(1, 1, MessageType::MsgPropose, vec![test_entries]);
-    nt.send(vec![msg]);
-    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)]);
+    nt.send(vec![msg]).await;
+    nt.send(vec![new_message(3, 3, MessageType::MsgHup, 0)])
+        .await;
     assert_eq!(nt.peers[&3].state, StateRole::Leader);
 
     // Recover and request the latest snapshot.
@@ -5085,8 +5329,10 @@ fn test_request_snapshot_step_down() {
         .get_mut(&2)
         .unwrap()
         .request_snapshot(request_idx)
+        .await
         .unwrap();
-    nt.send(vec![new_message(3, 3, MessageType::MsgBeat, 0)]);
+    nt.send(vec![new_message(3, 3, MessageType::MsgBeat, 0)])
+        .await;
     assert!(
         nt.peers[&2].pending_request_snapshot == INVALID_INDEX,
         "{}",
@@ -5095,20 +5341,25 @@ fn test_request_snapshot_step_down() {
 }
 
 // Abort request snapshot if it becomes leader or candidate.
-#[test]
-fn test_request_snapshot_on_role_change() {
-    let (mut nt, _) = prepare_request_snapshot();
+#[tokio::test]
+async fn test_request_snapshot_on_role_change() {
+    let (mut nt, _) = prepare_request_snapshot().await;
 
     let request_idx = nt.peers[&2].raft_log.committed;
     nt.peers
         .get_mut(&2)
         .unwrap()
         .request_snapshot(request_idx)
+        .await
         .unwrap();
 
     // Becoming follower does not reset pending_request_snapshot.
     let (term, id) = (nt.peers[&1].term, nt.peers[&1].id);
-    nt.peers.get_mut(&2).unwrap().become_follower(term, id);
+    nt.peers
+        .get_mut(&2)
+        .unwrap()
+        .become_follower(term, id)
+        .await;
     assert!(
         nt.peers[&2].pending_request_snapshot != INVALID_INDEX,
         "{}",
@@ -5116,7 +5367,7 @@ fn test_request_snapshot_on_role_change() {
     );
 
     // Becoming candidate resets pending_request_snapshot.
-    nt.peers.get_mut(&2).unwrap().become_candidate();
+    nt.peers.get_mut(&2).unwrap().become_candidate().await;
     assert!(
         nt.peers[&2].pending_request_snapshot == INVALID_INDEX,
         "{}",
@@ -5128,8 +5379,8 @@ fn test_request_snapshot_on_role_change() {
 ///
 /// 1. Logs should be replicated to at least different groups before committed;
 /// 2. all peers are configured to the same group, simple quorum should be used.
-#[test]
-fn test_group_commit() {
+#[tokio::test]
+async fn test_group_commit() {
     let l = default_logger();
     let mut tests = vec![
         // Single
@@ -5152,7 +5403,7 @@ fn test_group_commit() {
     ];
 
     for (i, (matches, group_ids, g_w, q_w)) in tests.drain(..).enumerate() {
-        let store = MemStorage::new_with_conf_state((vec![1], vec![]));
+        let store = MemStorage::new_with_conf_state((vec![1], vec![])).await;
         let min_index = *matches.iter().min().unwrap();
         let max_index = *matches.iter().max().unwrap();
         let logs: Vec<_> = (min_index..=max_index).map(|i| empty_entry(1, i)).collect();
@@ -5161,13 +5412,13 @@ fn test_group_commit() {
         hs.term = 1;
         store.wl().set_hardstate(hs);
         let cfg = new_test_config(1, 5, 1);
-        let mut sm = new_test_raft_with_config(&cfg, store, &l);
+        let mut sm = new_test_raft_with_config(&cfg, store, &l).await;
 
         let mut groups = vec![];
         for (j, (m, g)) in matches.into_iter().zip(group_ids).enumerate() {
             let id = j as u64 + 1;
             if sm.mut_prs().get(id).is_none() {
-                sm.apply_conf_change(&add_node(id)).unwrap();
+                sm.apply_conf_change(&add_node(id)).await.unwrap();
                 let pr = sm.mut_prs().get_mut(id).unwrap();
                 pr.matched = m;
                 pr.next_idx = m + 1;
@@ -5176,8 +5427,8 @@ fn test_group_commit() {
                 groups.push((id, g));
             }
         }
-        sm.enable_group_commit(true);
-        sm.assign_commit_groups(&groups);
+        sm.enable_group_commit(true).await;
+        sm.assign_commit_groups(&groups).await;
         if sm.raft_log.committed != 0 {
             panic!(
                 "#{}: follower group committed {}, want 0",
@@ -5185,14 +5436,14 @@ fn test_group_commit() {
             );
         }
         sm.state = StateRole::Leader;
-        sm.assign_commit_groups(&groups);
+        sm.assign_commit_groups(&groups).await;
         if sm.raft_log.committed != g_w {
             panic!(
                 "#{}: leader group committed {}, want {}",
                 i, sm.raft_log.committed, g_w
             );
         }
-        sm.enable_group_commit(false);
+        sm.enable_group_commit(false).await;
         if sm.raft_log.committed != q_w {
             panic!(
                 "#{}: quorum committed {}, want {}",
@@ -5202,8 +5453,8 @@ fn test_group_commit() {
     }
 }
 
-#[test]
-fn test_group_commit_consistent() {
+#[tokio::test]
+async fn test_group_commit_consistent() {
     let l = default_logger();
     let mut logs = vec![];
     for i in 1..6 {
@@ -5284,7 +5535,7 @@ fn test_group_commit_consistent() {
     ];
 
     for (i, (matches, group_ids, committed, applied, role, exp)) in tests.drain(..).enumerate() {
-        let store = MemStorage::new_with_conf_state((vec![1], vec![]));
+        let store = MemStorage::new_with_conf_state((vec![1], vec![])).await;
         store.wl().append(&logs).unwrap();
         let mut hs = HardState::default();
         hs.term = 2;
@@ -5292,14 +5543,14 @@ fn test_group_commit_consistent() {
         store.wl().set_hardstate(hs);
         let mut cfg = new_test_config(1, 5, 1);
         cfg.applied = applied;
-        let mut sm = new_test_raft_with_config(&cfg, store, &l);
+        let mut sm = new_test_raft_with_config(&cfg, store, &l).await;
         sm.state = role;
 
         let mut groups = vec![];
         for (j, (m, g)) in matches.into_iter().zip(group_ids).enumerate() {
             let id = j as u64 + 1;
             if sm.mut_prs().get(id).is_none() {
-                sm.apply_conf_change(&add_node(id)).unwrap();
+                sm.apply_conf_change(&add_node(id)).await.unwrap();
                 let pr = sm.mut_prs().get_mut(id).unwrap();
                 pr.matched = m;
                 pr.next_idx = m + 1;
@@ -5308,9 +5559,9 @@ fn test_group_commit_consistent() {
                 groups.push((id, g));
             }
         }
-        sm.assign_commit_groups(&groups);
+        sm.assign_commit_groups(&groups).await;
         if Some(true) == exp {
-            let is_consistent = sm.check_group_commit_consistent();
+            let is_consistent = sm.check_group_commit_consistent().await;
             if is_consistent != Some(false) {
                 panic!(
                     "#{}: consistency = {:?}, want Some(false)",
@@ -5318,8 +5569,8 @@ fn test_group_commit_consistent() {
                 );
             }
         }
-        sm.enable_group_commit(true);
-        let is_consistent = sm.check_group_commit_consistent();
+        sm.enable_group_commit(true).await;
+        let is_consistent = sm.check_group_commit_consistent().await;
         if is_consistent != exp {
             panic!("#{}: consistency = {:?}, want {:?}", i, is_consistent, exp);
         }
@@ -5328,8 +5579,8 @@ fn test_group_commit_consistent() {
 
 /// test_election_with_priority_log verifies the correctness
 /// of the election with both priority and log.
-#[test]
-fn test_election_with_priority_log() {
+#[tokio::test]
+async fn test_election_with_priority_log() {
     let tests = vec![
         // log is up to date or not 1..3, priority 1..3, id, state
         (true, false, false, 3, 1, 1, 1, StateRole::Leader),
@@ -5347,26 +5598,28 @@ fn test_election_with_priority_log() {
 
     for (_i, &(l1, l2, l3, p1, p2, p3, id, state)) in tests.iter().enumerate() {
         let l = default_logger();
-        let mut n1 = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l);
-        let mut n2 = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l);
-        let mut n3 = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l);
+        let mut n1 = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+        let mut n2 = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+        let mut n3 = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
         n1.set_priority(p1);
         n2.set_priority(p2);
         n3.set_priority(p3);
         let entries = vec![new_entry(1, 1, SOME_DATA), new_entry(1, 1, SOME_DATA)];
         if l1 {
-            n1.raft_log.append(&entries);
+            n1.raft_log.append(&entries).await;
         }
         if l2 {
-            n2.raft_log.append(&entries);
+            n2.raft_log.append(&entries).await;
         }
         if l3 {
-            n3.raft_log.append(&entries);
+            n3.raft_log.append(&entries).await;
         }
 
-        let mut network = Network::new(vec![Some(n1), Some(n2), Some(n3)], &l);
+        let mut network = Network::new(vec![Some(n1), Some(n2), Some(n3)], &l).await;
 
-        network.send(vec![new_message(id, id, MessageType::MsgHup, 0)]);
+        network
+            .send(vec![new_message(id, id, MessageType::MsgHup, 0)])
+            .await;
 
         assert_eq!(network.peers[&id].state, state);
     }
@@ -5374,22 +5627,24 @@ fn test_election_with_priority_log() {
 
 /// test_election_after_change_priority verifies that a peer can win an election
 /// by raising its priority and lose election by lowering its priority.
-#[test]
-fn test_election_after_change_priority() {
+#[tokio::test]
+async fn test_election_after_change_priority() {
     let l = default_logger();
-    let mut n1 = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l);
-    let mut n2 = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l);
-    let mut n3 = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l);
+    let mut n1 = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+    let mut n2 = new_test_raft(2, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+    let mut n3 = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
     // priority of n1 is 0 in default.
     n2.set_priority(2);
     n3.set_priority(3);
-    n1.become_follower(1, INVALID_ID);
-    n2.become_follower(1, INVALID_ID);
-    n3.become_follower(1, INVALID_ID);
-    let mut network = Network::new(vec![Some(n1), Some(n2), Some(n3)], &l);
+    n1.become_follower(1, INVALID_ID).await;
+    n2.become_follower(1, INVALID_ID).await;
+    n3.become_follower(1, INVALID_ID).await;
+    let mut network = Network::new(vec![Some(n1), Some(n2), Some(n3)], &l).await;
 
     assert_eq!(network.peers[&1].priority, 0, "peer 1 priority");
-    network.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    network
+        .send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
     // check state
     assert_eq!(network.peers[&1].state, StateRole::Follower, "peer 1 state");
 
@@ -5405,9 +5660,12 @@ fn test_election_after_change_priority() {
             .peers
             .get_mut(&id)
             .unwrap()
-            .become_follower((i + 2) as u64, INVALID_ID);
+            .become_follower((i + 2) as u64, INVALID_ID)
+            .await;
         network.peers.get_mut(&id).unwrap().set_priority(p);
-        network.send(vec![new_message(id, id, MessageType::MsgHup, 0)]);
+        network
+            .send(vec![new_message(id, id, MessageType::MsgHup, 0)])
+            .await;
 
         // check state
         assert_eq!(network.peers[&id].state, state, "peer {} state", id);
@@ -5416,16 +5674,16 @@ fn test_election_after_change_priority() {
 
 // `test_read_when_quorum_becomes_less` tests read requests could be handled earlier
 // if quorum becomes less in configuration changes.
-#[test]
-fn test_read_when_quorum_becomes_less() {
+#[tokio::test]
+async fn test_read_when_quorum_becomes_less() {
     let l = default_logger();
-    let mut network = Network::new(vec![None, None], &l);
+    let mut network = Network::new(vec![None, None], &l).await;
 
     let mut m = Message::default();
     m.from = 1;
     m.to = 1;
     m.set_msg_type(MessageType::MsgHup);
-    network.send(vec![m]);
+    network.send(vec![m]).await;
     assert_eq!(network.peers[&1].raft_log.committed, 1);
 
     // Read index on the peer.
@@ -5435,11 +5693,11 @@ fn test_read_when_quorum_becomes_less() {
     let mut e = Entry::default();
     e.data = (b"abcdefg" as &'static [u8]).into();
     m.entries = vec![e];
-    network.dispatch(vec![m]).unwrap();
+    network.dispatch(vec![m]).await.unwrap();
 
     // Broadcast heartbeats.
     let heartbeats = network.read_messages();
-    network.dispatch(heartbeats).unwrap();
+    network.dispatch(heartbeats).await.unwrap();
 
     // Drop heartbeat response from peer 2.
     let heartbeat_responses = network.read_messages();
@@ -5450,37 +5708,39 @@ fn test_read_when_quorum_becomes_less() {
         .get_mut(&1)
         .unwrap()
         .apply_conf_change(&remove_node(2))
+        .await
         .unwrap();
     assert!(!network.peers[&1].read_states.is_empty());
 }
 
-#[test]
-fn test_uncommitted_entries_size_limit() {
+#[tokio::test]
+async fn test_uncommitted_entries_size_limit() {
     let l = default_logger();
     let config = &Config {
         id: 1,
         max_uncommitted_size: 12,
         ..Config::default()
     };
-    let mut nt = Network::new_with_config(vec![None, None, None], config, &l);
+    let mut nt = Network::new_with_config(vec![None, None, None], config, &l).await;
     let data = b"hello world!".to_vec();
     let mut entry = Entry::default();
     entry.data = data.to_vec();
     let msg = new_message_with_entries(1, 1, MessageType::MsgPropose, vec![entry]);
 
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     // should return ok
-    nt.dispatch(vec![msg.clone()].to_vec()).unwrap();
+    nt.dispatch(vec![msg.clone()].to_vec()).await.unwrap();
 
     // then next proposal should be dropped
-    let result = nt.dispatch(vec![msg].to_vec());
+    let result = nt.dispatch(vec![msg].to_vec()).await;
     assert_eq!(result.unwrap_err(), raft::Error::ProposalDropped);
 
     // but entry with empty size should be accepted
     let entry = Entry::default();
     let empty_msg = new_message_with_entries(1, 1, MessageType::MsgPropose, vec![entry]);
-    nt.dispatch(vec![empty_msg].to_vec()).unwrap();
+    nt.dispatch(vec![empty_msg].to_vec()).await.unwrap();
 
     // after reduce, new proposal should be accepted
     let mut entry = Entry::default();
@@ -5497,47 +5757,49 @@ fn test_uncommitted_entries_size_limit() {
     let mut entry = Entry::default();
     entry.data = (b"hello world and raft" as &'static [u8]).into();
     let long_msg = new_message_with_entries(1, 1, MessageType::MsgPropose, vec![entry]);
-    nt.dispatch(vec![long_msg].to_vec()).unwrap();
+    nt.dispatch(vec![long_msg].to_vec()).await.unwrap();
 
     // but another huge one will be dropped
     let mut entry = Entry::default();
     entry.data = (b"hello world and raft" as &'static [u8]).into();
     let long_msg = new_message_with_entries(1, 1, MessageType::MsgPropose, vec![entry]);
-    nt.dispatch(vec![long_msg].to_vec()).unwrap_err();
+    nt.dispatch(vec![long_msg].to_vec()).await.unwrap_err();
 
     // entry with empty size should still be accepted
     let entry = Entry::default();
     let empty_msg = new_message_with_entries(1, 1, MessageType::MsgPropose, vec![entry]);
-    nt.dispatch(vec![empty_msg].to_vec()).unwrap();
+    nt.dispatch(vec![empty_msg].to_vec()).await.unwrap();
 }
 
-#[test]
-fn test_uncommitted_entry_after_leader_election() {
+#[tokio::test]
+async fn test_uncommitted_entry_after_leader_election() {
     let l = default_logger();
     let config = &Config {
         id: 1,
         max_uncommitted_size: 12,
         ..Config::default()
     };
-    let mut nt = Network::new_with_config(vec![None, None, None, None, None], config, &l);
+    let mut nt = Network::new_with_config(vec![None, None, None, None, None], config, &l).await;
     let data = b"hello world!".to_vec();
     let mut entry = Entry::default();
     entry.data = data;
     let msg = new_message_with_entries(1, 1, MessageType::MsgPropose, vec![entry]);
 
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     // create a uncommitted entry on node2
     nt.cut(1, 3);
     nt.cut(1, 4);
     nt.cut(1, 5);
-    nt.send(vec![msg]);
+    nt.send(vec![msg]).await;
 
     // now isolate master and make node2 as master
     nt.isolate(1);
     // ignore message append, cluster only work on election
     nt.ignore(MessageType::MsgAppend);
-    nt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)])
+        .await;
 
     // uncommitted log size should be 0 on node2,
     // because we set uncommitted size to 0 rather than re-computing it,
@@ -5546,38 +5808,42 @@ fn test_uncommitted_entry_after_leader_election() {
     assert_eq!(nt.peers.get_mut(&2).unwrap().uncommitted_size(), 0);
 }
 
-#[test]
-fn test_uncommitted_state_advance_ready_from_last_term() {
+#[tokio::test]
+async fn test_uncommitted_state_advance_ready_from_last_term() {
     let l = default_logger();
     let config = &Config {
         id: 1,
         max_uncommitted_size: 12,
         ..Config::default()
     };
-    let mut nt = Network::new_with_config(vec![None, None, None, None, None], config, &l);
+    let mut nt = Network::new_with_config(vec![None, None, None, None, None], config, &l).await;
 
     let data = b"hello world!".to_vec();
     let mut ent = Entry::default();
     ent.data = data.clone();
 
-    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+        .await;
 
     nt.send(vec![new_message_with_entries(
         1,
         1,
         MessageType::MsgPropose,
         vec![ent.clone()],
-    )]);
+    )])
+    .await;
     nt.send(vec![new_message_with_entries(
         1,
         1,
         MessageType::MsgPropose,
         vec![ent.clone()],
-    )]);
+    )])
+    .await;
 
     // now node2 has 2 committed entries
     // make node2 leader
-    nt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)]);
+    nt.send(vec![new_message(2, 2, MessageType::MsgHup, 0)])
+        .await;
     assert_eq!(nt.peers.get_mut(&2).unwrap().state, raft::StateRole::Leader);
 
     nt.isolate(2);
@@ -5587,7 +5853,8 @@ fn test_uncommitted_state_advance_ready_from_last_term() {
         2,
         MessageType::MsgPropose,
         vec![ent.clone()],
-    )]);
+    )])
+    .await;
 
     let mut ent1 = ent.clone();
     ent1.index = 1;
@@ -5604,8 +5871,8 @@ fn test_uncommitted_state_advance_ready_from_last_term() {
     assert_eq!(nt.peers.get_mut(&2).unwrap().uncommitted_size(), data.len());
 }
 
-#[test]
-fn test_fast_log_rejection() {
+#[tokio::test]
+async fn test_fast_log_rejection() {
     let mut tests = vec![
         // This case tests that leader can find the conflict index quickly.
         // Firstly leader appends (type=MsgApp,index=7,logTerm=4, entries=...);
@@ -5825,15 +6092,16 @@ fn test_fast_log_rejection() {
     ) in tests.drain(..).enumerate()
     {
         let l = default_logger();
-        let s1 = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![]));
+        let s1 = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![])).await;
         s1.wl().append(&leader_log).unwrap();
-        let s2 = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![]));
+        let s2 = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![])).await;
         s2.wl().append(&follower_log).unwrap();
-        let mut n1 = new_test_raft(1, vec![1, 2, 3], 10, 1, s1, &l);
-        let mut n2 = new_test_raft(2, vec![1, 2, 3], 10, 1, s2, &l);
-        n1.become_candidate();
-        n1.become_leader();
+        let mut n1 = new_test_raft(1, vec![1, 2, 3], 10, 1, s1, &l).await;
+        let mut n2 = new_test_raft(2, vec![1, 2, 3], 10, 1, s2, &l).await;
+        n1.become_candidate().await;
+        n1.become_leader().await;
         n2.step(new_message(2, 2, MessageType::MsgHeartbeat, 0))
+            .await
             .unwrap();
 
         let mut msgs = n2.read_messages();
@@ -5845,12 +6113,12 @@ fn test_fast_log_rejection() {
             i
         );
         // move Vec item by pop
-        n1.step(msgs.pop().unwrap()).unwrap();
+        n1.step(msgs.pop().unwrap()).await.unwrap();
 
         let mut msgs = n1.read_messages();
         assert_eq!(msgs.len(), 1, "#{}", i);
         assert_eq!(msgs[0].msg_type(), MessageType::MsgAppend, "#{}", i);
-        n2.step(msgs.pop().unwrap()).unwrap();
+        n2.step(msgs.pop().unwrap()).await.unwrap();
 
         let mut msgs = n2.read_messages();
         assert_eq!(msgs.len(), 1, "#{}", i);
@@ -5858,7 +6126,7 @@ fn test_fast_log_rejection() {
         assert!(msgs[0].reject, "#{}", i);
         assert_eq!(msgs[0].reject_hint, reject_hint_index, "#{}", i);
         assert_eq!(msgs[0].log_term, reject_hint_term, "#{}", i);
-        n1.step(msgs.pop().unwrap()).unwrap();
+        n1.step(msgs.pop().unwrap()).await.unwrap();
 
         let msgs = n1.read_messages();
         assert_eq!(msgs.len(), 1, "#{}", i);
@@ -5867,26 +6135,26 @@ fn test_fast_log_rejection() {
     }
 }
 
-#[test]
-fn test_switching_check_quorum() {
+#[tokio::test]
+async fn test_switching_check_quorum() {
     let l = default_logger();
-    let mut sm = new_test_raft(1, vec![1, 2, 3], 5, 1, new_storage(), &l);
+    let mut sm = new_test_raft(1, vec![1, 2, 3], 5, 1, new_storage(), &l).await;
 
     sm.set_check_quorum(true);
-    sm.become_candidate();
-    sm.become_leader();
+    sm.become_candidate().await;
+    sm.become_leader().await;
     for _ in 0..=sm.election_timeout() {
-        sm.tick();
+        sm.tick().await;
     }
     assert_ne!(sm.state, StateRole::Leader);
 
-    sm.persist();
+    sm.persist().await;
     sm.set_check_quorum(false);
-    sm.become_candidate();
-    sm.become_leader();
+    sm.become_candidate().await;
+    sm.become_leader().await;
 
     for _ in 0..=sm.election_timeout() {
-        sm.tick();
+        sm.tick().await;
     }
     assert_eq!(sm.state, StateRole::Leader);
 }

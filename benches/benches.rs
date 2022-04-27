@@ -17,8 +17,10 @@ fn main() {
         .measurement_time(Duration::from_secs(1))
         .configure_from_args();
 
-    suites::bench_raft(&mut c);
-    suites::bench_raw_node(&mut c);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    suites::bench_raft(&mut c, &rt);
+    suites::bench_raw_node(&mut c, &rt);
     suites::bench_progress(&mut c);
 
     c.final_summary();

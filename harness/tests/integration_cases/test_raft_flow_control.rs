@@ -20,18 +20,19 @@ use raft::{default_logger, eraftpb::*};
 // test_msg_app_flow_control_full ensures:
 // 1. msgApp can fill the sending window until full
 // 2. when the window is full, no more msgApp can be sent.
-#[test]
-fn test_msg_app_flow_control_full() {
+#[tokio::test]
+async fn test_msg_app_flow_control_full() {
     let l = default_logger();
-    let mut r = new_test_raft(1, vec![1, 2], 5, 1, new_storage(), &l);
-    r.become_candidate();
-    r.become_leader();
+    let mut r = new_test_raft(1, vec![1, 2], 5, 1, new_storage(), &l).await;
+    r.become_candidate().await;
+    r.become_leader().await;
 
     // force the progress to be in replicate state
     r.mut_prs().get_mut(2).unwrap().become_replicate();
     // fill in the inflights window
     for i in 0..r.max_inflight {
         r.step(new_message(1, 1, MessageType::MsgPropose, 1))
+            .await
             .expect("");
         let ms = r.read_messages();
         if ms.len() != 1 {
@@ -45,6 +46,7 @@ fn test_msg_app_flow_control_full() {
     // ensure 2
     for i in 0..10 {
         r.step(new_message(1, 1, MessageType::MsgPropose, 1))
+            .await
             .expect("");
         let ms = r.read_messages();
         if !ms.is_empty() {
@@ -57,18 +59,19 @@ fn test_msg_app_flow_control_full() {
 // forward the sending window correctly:
 // 1. valid msgAppResp.index moves the windows to pass all smaller or equal index.
 // 2. out-of-dated msgAppResp has no effect on the sliding window.
-#[test]
-fn test_msg_app_flow_control_move_forward() {
+#[tokio::test]
+async fn test_msg_app_flow_control_move_forward() {
     let l = default_logger();
-    let mut r = new_test_raft(1, vec![1, 2], 5, 1, new_storage(), &l);
-    r.become_candidate();
-    r.become_leader();
+    let mut r = new_test_raft(1, vec![1, 2], 5, 1, new_storage(), &l).await;
+    r.become_candidate().await;
+    r.become_leader().await;
 
     // force the progress to be in replicate state
     r.mut_prs().get_mut(2).unwrap().become_replicate();
     // fill in the inflights window
     for _ in 0..r.max_inflight {
         r.step(new_message(1, 1, MessageType::MsgPropose, 1))
+            .await
             .expect("");
         r.read_messages();
     }
@@ -79,11 +82,12 @@ fn test_msg_app_flow_control_move_forward() {
         // move forward the window
         let mut m = new_message(2, 1, MessageType::MsgAppendResponse, 0);
         m.index = tt as u64;
-        r.step(m).expect("");
+        r.step(m).await.expect("");
         r.read_messages();
 
         // fill in the inflights window again
         r.step(new_message(1, 1, MessageType::MsgPropose, 1))
+            .await
             .expect("");
         let ms = r.read_messages();
         if ms.len() != 1 {
@@ -97,7 +101,7 @@ fn test_msg_app_flow_control_move_forward() {
         for i in 0..tt {
             let mut m = new_message(2, 1, MessageType::MsgAppendResponse, 0);
             m.index = i as u64;
-            r.step(m).expect("");
+            r.step(m).await.expect("");
             if !r.prs().get(2).unwrap().ins.full() {
                 panic!(
                     "#{}: inflights.full = {}, want true",
@@ -111,18 +115,19 @@ fn test_msg_app_flow_control_move_forward() {
 
 // test_msg_app_flow_control_recv_heartbeat ensures a heartbeat response
 // frees one slot if the window is full.
-#[test]
-fn test_msg_app_flow_control_recv_heartbeat() {
+#[tokio::test]
+async fn test_msg_app_flow_control_recv_heartbeat() {
     let l = default_logger();
-    let mut r = new_test_raft(1, vec![1, 2], 5, 1, new_storage(), &l);
-    r.become_candidate();
-    r.become_leader();
+    let mut r = new_test_raft(1, vec![1, 2], 5, 1, new_storage(), &l).await;
+    r.become_candidate().await;
+    r.become_leader().await;
 
     // force the progress to be in replicate state
     r.mut_prs().get_mut(2).unwrap().become_replicate();
     // fill in the inflights window
     for _ in 0..r.max_inflight {
         r.step(new_message(1, 1, MessageType::MsgPropose, 1))
+            .await
             .expect("");
         r.read_messages();
     }
@@ -139,6 +144,7 @@ fn test_msg_app_flow_control_recv_heartbeat() {
         // recv tt MsgHeartbeatResp and expect one free slot
         for i in 0..tt {
             r.step(new_message(2, 1, MessageType::MsgHeartbeatResponse, 0))
+                .await
                 .expect("");
             r.read_messages();
             if r.prs().get(2).unwrap().ins.full() {
@@ -153,6 +159,7 @@ fn test_msg_app_flow_control_recv_heartbeat() {
 
         // one slot
         r.step(new_message(1, 1, MessageType::MsgPropose, 1))
+            .await
             .expect("");
         let ms = r.read_messages();
         if ms.len() != 1 {
@@ -162,6 +169,7 @@ fn test_msg_app_flow_control_recv_heartbeat() {
         // and just one slot
         for i in 0..10 {
             r.step(new_message(1, 1, MessageType::MsgPropose, 1))
+                .await
                 .expect("");
             let ms1 = r.read_messages();
             if !ms1.is_empty() {
@@ -171,18 +179,19 @@ fn test_msg_app_flow_control_recv_heartbeat() {
 
         // clear all pending messages
         r.step(new_message(2, 1, MessageType::MsgHeartbeatResponse, 0))
+            .await
             .expect("");
         r.read_messages();
     }
 }
 
-#[test]
-fn test_msg_app_flow_control_with_freeing_resources() {
+#[tokio::test]
+async fn test_msg_app_flow_control_with_freeing_resources() {
     let l = default_logger();
-    let mut r = new_test_raft(1, vec![1, 2, 3], 5, 1, new_storage(), &l);
+    let mut r = new_test_raft(1, vec![1, 2, 3], 5, 1, new_storage(), &l).await;
 
-    r.become_candidate();
-    r.become_leader();
+    r.become_candidate().await;
+    r.become_leader().await;
 
     for (_, pr) in r.prs().iter() {
         assert!(!pr.ins.buffer_is_allocated());
@@ -194,6 +203,7 @@ fn test_msg_app_flow_control_with_freeing_resources() {
     }
 
     r.step(new_message(1, 1, MessageType::MsgPropose, 1))
+        .await
         .unwrap();
 
     for (&id, pr) in r.prs().iter() {
@@ -210,8 +220,8 @@ fn test_msg_app_flow_control_with_freeing_resources() {
     */
 
     let mut resp = new_message(2, 1, MessageType::MsgAppendResponse, 0);
-    resp.index = r.raft_log.last_index();
-    r.step(resp).unwrap();
+    resp.index = r.raft_log.last_index().await;
+    r.step(resp).await.unwrap();
 
     assert_eq!(r.prs().get(2).unwrap().ins.count(), 0);
 
@@ -222,6 +232,7 @@ fn test_msg_app_flow_control_with_freeing_resources() {
     */
 
     r.step(new_message(1, 1, MessageType::MsgPropose, 1))
+        .await
         .unwrap();
 
     assert_eq!(r.prs().get(2).unwrap().ins.count(), 1);
@@ -234,8 +245,8 @@ fn test_msg_app_flow_control_with_freeing_resources() {
     */
 
     let mut resp = new_message(2, 1, MessageType::MsgAppendResponse, 0);
-    resp.index = r.raft_log.last_index();
-    r.step(resp).unwrap();
+    resp.index = r.raft_log.last_index().await;
+    r.step(resp).await.unwrap();
 
     assert_eq!(r.prs().get(2).unwrap().ins.count(), 0);
     assert_eq!(r.prs().get(3).unwrap().ins.count(), 2);
@@ -261,18 +272,19 @@ fn test_msg_app_flow_control_with_freeing_resources() {
 }
 
 // Test progress can be disabled with `adjust_max_inflight_msgs(<id>, 0)`.
-#[test]
-fn test_disable_progress() {
+#[tokio::test]
+async fn test_disable_progress() {
     let l = default_logger();
-    let mut r = new_test_raft(1, vec![1, 2], 5, 1, new_storage(), &l);
-    r.become_candidate();
-    r.become_leader();
+    let mut r = new_test_raft(1, vec![1, 2], 5, 1, new_storage(), &l).await;
+    r.become_candidate().await;
+    r.become_leader().await;
 
     r.mut_prs().get_mut(2).unwrap().become_replicate();
 
     // Disable the progress 2. Internal `free`s shouldn't fail.
     r.adjust_max_inflight_msgs(2, 0);
     r.step(new_message(2, 1, MessageType::MsgHeartbeatResponse, 0))
+        .await
         .unwrap();
     assert!(r.prs().get(2).unwrap().ins.full());
     assert_eq!(r.prs().get(2).unwrap().ins.count(), 0);
@@ -285,6 +297,7 @@ fn test_disable_progress() {
     // its leader can continue to append entries to it.
     r.adjust_max_inflight_msgs(2, 10);
     r.step(new_message(2, 1, MessageType::MsgHeartbeatResponse, 0))
+        .await
         .unwrap();
     let msgs = r.read_messages();
     assert_eq!(msgs.len(), 1);

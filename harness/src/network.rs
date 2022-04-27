@@ -69,13 +69,13 @@ impl Network {
     ///
     /// A `None` node will be replaced with a new Raft node, and its configuration will
     /// be `peers`.
-    pub fn new(peers: Vec<Option<Interface>>, l: &Logger) -> Network {
+    pub async fn new(peers: Vec<Option<Interface>>, l: &Logger) -> Network {
         let config = Network::default_config();
-        Network::new_with_config(peers, &config, l)
+        Network::new_with_config(peers, &config, l).await
     }
 
     /// Initialize a network from `peers` with explicitly specified `config`.
-    pub fn new_with_config(
+    pub async fn new_with_config(
         mut peers: Vec<Option<Interface>>,
         config: &Config,
         l: &Logger,
@@ -88,11 +88,11 @@ impl Network {
             match p {
                 None => {
                     let conf_state = ConfState::from((peer_addrs.clone(), vec![]));
-                    let store = MemStorage::new_with_conf_state(conf_state);
+                    let store = MemStorage::new_with_conf_state(conf_state).await;
                     nstorage.insert(*id, store.clone());
                     let mut config = config.clone();
                     config.id = *id;
-                    let r = Raft::new(&config, store, l).unwrap().into();
+                    let r = Raft::new(&config, store, l).await.unwrap().into();
                     npeers.insert(*id, r);
                 }
                 Some(r) => {
@@ -154,16 +154,16 @@ impl Network {
     /// Instruct the cluster to `step` through the given messages.
     ///
     /// NOTE: the given `msgs` won't be filtered by its filters.
-    pub fn send(&mut self, msgs: Vec<Message>) {
+    pub async fn send(&mut self, msgs: Vec<Message>) {
         let mut msgs = msgs;
         while !msgs.is_empty() {
             let mut new_msgs = vec![];
             for m in msgs.drain(..) {
                 let resp = {
                     let p = self.peers.get_mut(&m.to).unwrap();
-                    let _ = p.step(m);
+                    let _ = p.step(m).await;
                     // The unstable data should be persisted before sending msg.
-                    p.persist();
+                    p.persist().await;
                     p.read_messages()
                 };
                 new_msgs.append(&mut self.filter(resp));
@@ -173,18 +173,18 @@ impl Network {
     }
 
     /// Filter `msgs` and then instruct the cluster to `step` through the given messages.
-    pub fn filter_and_send(&mut self, msgs: Vec<Message>) {
-        self.send(self.filter(msgs));
+    pub async fn filter_and_send(&mut self, msgs: Vec<Message>) {
+        self.send(self.filter(msgs)).await;
     }
 
     /// Dispatches the given messages to the appropriate peers.
     ///
     /// Unlike `send` this does not gather and send any responses. It also does not ignore errors.
-    pub fn dispatch(&mut self, messages: impl IntoIterator<Item = Message>) -> Result<()> {
+    pub async fn dispatch(&mut self, messages: impl IntoIterator<Item = Message>) -> Result<()> {
         for message in self.filter(messages.into_iter().map(Into::into)) {
             let to = message.to;
             let peer = self.peers.get_mut(&to).unwrap();
-            peer.step(message)?;
+            peer.step(message).await?;
         }
         Ok(())
     }

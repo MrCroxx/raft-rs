@@ -26,7 +26,7 @@ mod protos {
         impl Snapshot {
             /// For a given snapshot, determine if it's empty or not.
             pub fn is_empty(&self) -> bool {
-                self.metadata.as_ref().unwrap().index == 0
+                self.metadata.is_none() || self.metadata.as_ref().unwrap().index == 0
             }
         }
 

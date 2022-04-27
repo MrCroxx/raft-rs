@@ -21,16 +21,16 @@ use raft::storage::MemStorage;
 use raft::*;
 use slog::Logger;
 
-pub fn commit_noop_entry(r: &mut Interface, s: &MemStorage) {
+pub async fn commit_noop_entry(r: &mut Interface, s: &MemStorage) {
     assert_eq!(r.state, StateRole::Leader);
-    r.bcast_append();
+    r.bcast_append().await;
     // simulate the response of MsgAppend
     let msgs = r.read_messages();
     for m in msgs {
         assert_eq!(m.msg_type(), MessageType::MsgAppend);
         assert_eq!(m.entries.len(), 1);
         assert!(m.entries[0].data.is_empty());
-        r.step(accept_and_reply(&m)).expect("");
+        r.step(accept_and_reply(&m)).await.expect("");
     }
     // ignore further messages to refresh followers' commit index
     r.read_messages();
@@ -39,9 +39,9 @@ pub fn commit_noop_entry(r: &mut Interface, s: &MemStorage) {
         let (last_idx, last_term) = (e.index, e.term);
         r.raft_log.stable_entries(last_idx, last_term);
         s.wl().append(&unstable).expect("");
-        r.on_persist_entries(last_idx, last_term);
+        r.on_persist_entries(last_idx, last_term).await;
         let committed = r.raft_log.committed;
-        r.commit_apply(committed);
+        r.commit_apply(committed).await;
     }
 }
 
@@ -53,22 +53,22 @@ fn accept_and_reply(m: &Message) -> Message {
     reply
 }
 
-#[test]
-fn test_follower_update_term_from_message() {
+#[tokio::test]
+async fn test_follower_update_term_from_message() {
     let l = default_logger();
-    test_update_term_from_message(StateRole::Follower, &l);
+    test_update_term_from_message(StateRole::Follower, &l).await;
 }
 
-#[test]
-fn test_candidate_update_term_from_message() {
+#[tokio::test]
+async fn test_candidate_update_term_from_message() {
     let l = default_logger();
-    test_update_term_from_message(StateRole::Candidate, &l);
+    test_update_term_from_message(StateRole::Candidate, &l).await;
 }
 
-#[test]
-fn test_leader_update_term_from_message() {
+#[tokio::test]
+async fn test_leader_update_term_from_message() {
     let l = default_logger();
-    test_update_term_from_message(StateRole::Leader, &l);
+    test_update_term_from_message(StateRole::Leader, &l).await;
 }
 
 // test_update_term_from_message tests that if one server’s current term is
@@ -76,21 +76,21 @@ fn test_leader_update_term_from_message() {
 // value. If a candidate or leader discovers that its term is out of date,
 // it immediately reverts to follower state.
 // Reference: section 5.1
-fn test_update_term_from_message(state: StateRole, l: &Logger) {
-    let mut r = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), l);
+async fn test_update_term_from_message(state: StateRole, l: &Logger) {
+    let mut r = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), l).await;
     match state {
-        StateRole::Follower => r.become_follower(1, 2),
+        StateRole::Follower => r.become_follower(1, 2).await,
         StateRole::PreCandidate => r.become_pre_candidate(),
-        StateRole::Candidate => r.become_candidate(),
+        StateRole::Candidate => r.become_candidate().await,
         StateRole::Leader => {
-            r.become_candidate();
-            r.become_leader();
+            r.become_candidate().await;
+            r.become_leader().await;
         }
     }
 
     let mut m = new_message(0, 0, MessageType::MsgAppend, 0);
     m.term = 2;
-    r.step(m).expect("");
+    r.step(m).await.expect("");
 
     assert_eq!(r.term, 2);
     assert_eq!(r.state, StateRole::Follower);
@@ -98,10 +98,10 @@ fn test_update_term_from_message(state: StateRole, l: &Logger) {
 
 // test_start_as_follower tests that when servers start up, they begin as followers.
 // Reference: section 5.2
-#[test]
-fn test_start_as_follower() {
+#[tokio::test]
+async fn test_start_as_follower() {
     let l = default_logger();
-    let r = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l);
+    let r = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
     assert_eq!(r.state, StateRole::Follower);
 }
 
@@ -109,20 +109,20 @@ fn test_start_as_follower() {
 // it will send a msgApp with m.Index = 0, m.LogTerm=0 and empty entries as
 // heartbeat to all followers.
 // Reference: section 5.2
-#[test]
-fn test_leader_bcast_beat() {
+#[tokio::test]
+async fn test_leader_bcast_beat() {
     let l = default_logger();
     // heartbeat interval
     let hi = 1;
-    let mut r = new_test_raft(1, vec![1, 2, 3], 10, hi, new_storage(), &l);
-    r.become_candidate();
-    r.become_leader();
+    let mut r = new_test_raft(1, vec![1, 2, 3], 10, hi, new_storage(), &l).await;
+    r.become_candidate().await;
+    r.become_leader().await;
     for i in 0..10 {
-        let _ = r.append_entry(&mut [empty_entry(0, i as u64 + 1)]);
+        let _ = r.append_entry(&mut [empty_entry(0, i as u64 + 1)]).await;
     }
 
     for _ in 0..hi {
-        r.tick();
+        r.tick().await;
     }
 
     let mut msgs = r.read_messages();
@@ -139,16 +139,16 @@ fn test_leader_bcast_beat() {
     assert_eq!(msgs, expect_msgs);
 }
 
-#[test]
-fn test_follower_start_election() {
+#[tokio::test]
+async fn test_follower_start_election() {
     let l = default_logger();
-    test_nonleader_start_election(StateRole::Follower, &l);
+    test_nonleader_start_election(StateRole::Follower, &l).await;
 }
 
-#[test]
-fn test_candidate_start_new_election() {
+#[tokio::test]
+async fn test_candidate_start_new_election() {
     let l = default_logger();
-    test_nonleader_start_election(StateRole::Candidate, &l);
+    test_nonleader_start_election(StateRole::Candidate, &l).await;
 }
 
 // test_nonleader_start_election tests that if a follower receives no communication
@@ -161,18 +161,18 @@ fn test_candidate_start_new_election() {
 // start a new election by incrementing its term and initiating another
 // round of RequestVote RPCs.
 // Reference: section 5.2
-fn test_nonleader_start_election(state: StateRole, l: &Logger) {
+async fn test_nonleader_start_election(state: StateRole, l: &Logger) {
     // election timeout
     let et = 10;
-    let mut r = new_test_raft(1, vec![1, 2, 3], et, 1, new_storage(), l);
+    let mut r = new_test_raft(1, vec![1, 2, 3], et, 1, new_storage(), l).await;
     match state {
-        StateRole::Follower => r.become_follower(1, 2),
-        StateRole::Candidate => r.become_candidate(),
+        StateRole::Follower => r.become_follower(1, 2).await,
+        StateRole::Candidate => r.become_candidate().await,
         _ => panic!("Only non-leader role is accepted."),
     }
 
     for _ in 1..2 * et {
-        r.tick();
+        r.tick().await;
     }
 
     assert_eq!(r.term, 2);
@@ -195,8 +195,8 @@ fn test_nonleader_start_election(state: StateRole, l: &Logger) {
 // b) it loses the election
 // c) it is unclear about the result
 // Reference: section 5.2
-#[test]
-fn test_leader_election_in_one_round_rpc() {
+#[tokio::test]
+async fn test_leader_election_in_one_round_rpc() {
     let l = default_logger();
     let mut tests = vec![
         // win the election when receiving votes from a majority of the servers
@@ -230,14 +230,16 @@ fn test_leader_election_in_one_round_rpc() {
     ];
 
     for (i, (size, votes, state)) in tests.drain(..).enumerate() {
-        let mut r = new_test_raft(1, (1..=size as u64).collect(), 10, 1, new_storage(), &l);
+        let mut r = new_test_raft(1, (1..=size as u64).collect(), 10, 1, new_storage(), &l).await;
 
-        r.step(new_message(1, 1, MessageType::MsgHup, 0)).expect("");
+        r.step(new_message(1, 1, MessageType::MsgHup, 0))
+            .await
+            .expect("");
         for (id, vote) in votes {
             let mut m = new_message(id, 1, MessageType::MsgRequestVoteResponse, 0);
             m.term = r.term;
             m.reject = !vote;
-            r.step(m).expect("");
+            r.step(m).await.expect("");
         }
 
         if r.state != state {
@@ -252,8 +254,8 @@ fn test_leader_election_in_one_round_rpc() {
 // test_follower_vote tests that each follower will vote for at most one
 // candidate in a given term, on a first-come-first-served basis.
 // Reference: section 5.2
-#[test]
-fn test_follower_vote() {
+#[tokio::test]
+async fn test_follower_vote() {
     let l = default_logger();
     let mut tests = vec![
         (INVALID_ID, 1, false),
@@ -265,12 +267,12 @@ fn test_follower_vote() {
     ];
 
     for (i, (vote, nvote, wreject)) in tests.drain(..).enumerate() {
-        let mut r = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l);
-        r.load_state(&hard_state(1, 0, vote));
+        let mut r = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+        r.load_state(&hard_state(1, 0, vote)).await;
 
         let mut m = new_message(nvote, 1, MessageType::MsgRequestVote, 0);
         m.term = 1;
-        r.step(m).expect("");
+        r.step(m).await.expect("");
 
         let msgs = r.read_messages();
         let mut m = new_message(1, nvote, MessageType::MsgRequestVoteResponse, 0);
@@ -288,8 +290,8 @@ fn test_follower_vote() {
 // to be leader whose term is at least as large as the candidate's current term,
 // it recognizes the leader as legitimate and returns to follower state.
 // Reference: section 5.2
-#[test]
-fn test_candidate_fallback() {
+#[tokio::test]
+async fn test_candidate_fallback() {
     let l = default_logger();
     let new_message_ext = |f, to, term| {
         let mut m = new_message(f, to, MessageType::MsgAppend, 0);
@@ -298,12 +300,14 @@ fn test_candidate_fallback() {
     };
     let mut tests = vec![new_message_ext(2, 1, 2), new_message_ext(2, 1, 3)];
     for (i, m) in tests.drain(..).enumerate() {
-        let mut r = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l);
-        r.step(new_message(1, 1, MessageType::MsgHup, 0)).expect("");
+        let mut r = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+        r.step(new_message(1, 1, MessageType::MsgHup, 0))
+            .await
+            .expect("");
         assert_eq!(r.state, StateRole::Candidate);
 
         let term = m.term;
-        r.step(m).expect("");
+        r.step(m).await.expect("");
 
         if r.state != StateRole::Follower {
             panic!(
@@ -319,36 +323,36 @@ fn test_candidate_fallback() {
     }
 }
 
-#[test]
-fn test_follower_election_timeout_randomized() {
+#[tokio::test]
+async fn test_follower_election_timeout_randomized() {
     let l = default_logger();
-    test_non_leader_election_timeout_randomized(StateRole::Follower, &l);
+    test_non_leader_election_timeout_randomized(StateRole::Follower, &l).await;
 }
 
-#[test]
-fn test_candidate_election_timeout_randomized() {
+#[tokio::test]
+async fn test_candidate_election_timeout_randomized() {
     let l = default_logger();
-    test_non_leader_election_timeout_randomized(StateRole::Candidate, &l);
+    test_non_leader_election_timeout_randomized(StateRole::Candidate, &l).await;
 }
 
 // test_non_leader_election_timeout_randomized tests that election timeout for
 // follower or candidate is randomized.
 // Reference: section 5.2
-fn test_non_leader_election_timeout_randomized(state: StateRole, l: &Logger) {
+async fn test_non_leader_election_timeout_randomized(state: StateRole, l: &Logger) {
     let et = 10;
-    let mut r = new_test_raft(1, vec![1, 2, 3], et, 1, new_storage(), l);
+    let mut r = new_test_raft(1, vec![1, 2, 3], et, 1, new_storage(), l).await;
     let mut timeouts = map!();
     for _ in 0..1000 * et {
         let term = r.term;
         match state {
-            StateRole::Follower => r.become_follower(term + 1, 2),
-            StateRole::Candidate => r.become_candidate(),
+            StateRole::Follower => r.become_follower(term + 1, 2).await,
+            StateRole::Candidate => r.become_candidate().await,
             _ => panic!("only non leader state is accepted!"),
         }
 
         let mut time = 0;
         while r.read_messages().is_empty() {
-            r.tick();
+            r.tick().await;
             time += 1;
         }
         timeouts.insert(time, true);
@@ -360,37 +364,37 @@ fn test_non_leader_election_timeout_randomized(state: StateRole, l: &Logger) {
     }
 }
 
-#[test]
-fn test_follower_election_timeout_nonconflict() {
+#[tokio::test]
+async fn test_follower_election_timeout_nonconflict() {
     let l = default_logger();
-    test_nonleaders_election_timeout_nonconfict(StateRole::Follower, &l);
+    test_nonleaders_election_timeout_nonconfict(StateRole::Follower, &l).await;
 }
 
-#[test]
-fn test_candidates_election_timeout_nonconf() {
+#[tokio::test]
+async fn test_candidates_election_timeout_nonconf() {
     let l = default_logger();
-    test_nonleaders_election_timeout_nonconfict(StateRole::Candidate, &l);
+    test_nonleaders_election_timeout_nonconfict(StateRole::Candidate, &l).await;
 }
 
 // test_nonleaders_election_timeout_nonconfict tests that in most cases only a
 // single server(follower or candidate) will time out, which reduces the
 // likelihood of split vote in the new election.
 // Reference: section 5.2
-fn test_nonleaders_election_timeout_nonconfict(state: StateRole, l: &Logger) {
+async fn test_nonleaders_election_timeout_nonconfict(state: StateRole, l: &Logger) {
     let et = 10;
     let size = 5;
     let mut rs = Vec::with_capacity(size);
     let ids: Vec<u64> = (1..=size as u64).collect();
     for id in ids.iter().take(size) {
-        rs.push(new_test_raft(*id, ids.clone(), et, 1, new_storage(), l));
+        rs.push(new_test_raft(*id, ids.clone(), et, 1, new_storage(), l).await);
     }
     let mut conflicts = 0;
     for _ in 0..1000 {
         for r in &mut rs {
             let term = r.term;
             match state {
-                StateRole::Follower => r.become_follower(term + 1, INVALID_ID),
-                StateRole::Candidate => r.become_candidate(),
+                StateRole::Follower => r.become_follower(term + 1, INVALID_ID).await,
+                StateRole::Candidate => r.become_candidate().await,
                 _ => panic!("non leader state is expect!"),
             }
         }
@@ -398,7 +402,7 @@ fn test_nonleaders_election_timeout_nonconfict(state: StateRole, l: &Logger) {
         let mut timeout_num = 0;
         while timeout_num == 0 {
             for r in &mut rs {
-                r.tick();
+                r.tick().await;
                 if !r.read_messages().is_empty() {
                     timeout_num += 1;
                 }
@@ -421,20 +425,21 @@ fn test_nonleaders_election_timeout_nonconfict(state: StateRole, l: &Logger) {
 // the new entries.
 // Also, it writes the new entry into stable storage.
 // Reference: section 5.3
-#[test]
-fn test_leader_start_replication() {
+#[tokio::test]
+async fn test_leader_start_replication() {
     let l = default_logger();
     let s = new_storage();
-    let mut r = new_test_raft(1, vec![1, 2, 3], 10, 1, s.clone(), &l);
-    r.become_candidate();
-    r.become_leader();
-    commit_noop_entry(&mut r, &s);
-    let li = r.raft_log.last_index();
+    let mut r = new_test_raft(1, vec![1, 2, 3], 10, 1, s.clone(), &l).await;
+    r.become_candidate().await;
+    r.become_leader().await;
+    commit_noop_entry(&mut r, &s).await;
+    let li = r.raft_log.last_index().await;
 
     r.step(new_message(1, 1, MessageType::MsgPropose, 1))
+        .await
         .expect("");
 
-    assert_eq!(r.raft_log.last_index(), li + 1);
+    assert_eq!(r.raft_log.last_index().await, li + 1);
     assert_eq!(r.raft_log.committed, li);
     let mut msgs = r.read_messages();
     msgs.sort_by_key(|m| format!("{:?}", m));
@@ -463,26 +468,27 @@ fn test_leader_start_replication() {
 // and it includes that index in future AppendEntries RPCs so that the other
 // servers eventually find out.
 // Reference: section 5.3
-#[test]
-fn test_leader_commit_entry() {
+#[tokio::test]
+async fn test_leader_commit_entry() {
     let l = default_logger();
     let s = new_storage();
-    let mut r = new_test_raft(1, vec![1, 2, 3], 10, 1, s.clone(), &l);
-    r.become_candidate();
-    r.become_leader();
-    commit_noop_entry(&mut r, &s);
-    let li = r.raft_log.last_index();
+    let mut r = new_test_raft(1, vec![1, 2, 3], 10, 1, s.clone(), &l).await;
+    r.become_candidate().await;
+    r.become_leader().await;
+    commit_noop_entry(&mut r, &s).await;
+    let li = r.raft_log.last_index().await;
     r.step(new_message(1, 1, MessageType::MsgPropose, 1))
+        .await
         .expect("");
-    r.persist();
+    r.persist().await;
 
     for m in r.read_messages() {
-        r.step(accept_and_reply(&m)).expect("");
+        r.step(accept_and_reply(&m)).await.expect("");
     }
 
     assert_eq!(r.raft_log.committed, li + 1);
     let wents = vec![new_entry(1, li + 1, SOME_DATA)];
-    assert_eq!(r.raft_log.next_entries(None), Some(wents));
+    assert_eq!(r.raft_log.next_entries(None).await, Some(wents));
     let mut msgs = r.read_messages();
     msgs.sort_by_key(|m| format!("{:?}", m));
     for (i, m) in msgs.drain(..).enumerate() {
@@ -495,8 +501,8 @@ fn test_leader_commit_entry() {
 // test_leader_acknowledge_commit tests that a log entry is committed once the
 // leader that created the entry has replicated it on a majority of the servers.
 // Reference: section 5.3
-#[test]
-fn test_leader_acknowledge_commit() {
+#[tokio::test]
+async fn test_leader_acknowledge_commit() {
     let l = default_logger();
     let mut tests = vec![
         (1, map!(), true),
@@ -511,18 +517,19 @@ fn test_leader_acknowledge_commit() {
     ];
     for (i, (size, acceptors, wack)) in tests.drain(..).enumerate() {
         let s = new_storage();
-        let mut r = new_test_raft(1, (1..=size).collect(), 10, 1, s.clone(), &l);
-        r.become_candidate();
-        r.become_leader();
-        commit_noop_entry(&mut r, &s);
-        let li = r.raft_log.last_index();
+        let mut r = new_test_raft(1, (1..=size).collect(), 10, 1, s.clone(), &l).await;
+        r.become_candidate().await;
+        r.become_leader().await;
+        commit_noop_entry(&mut r, &s).await;
+        let li = r.raft_log.last_index().await;
         r.step(new_message(1, 1, MessageType::MsgPropose, 1))
+            .await
             .expect("");
-        r.persist();
+        r.persist().await;
 
         for m in r.read_messages() {
             if acceptors.contains_key(&m.to) && acceptors[&m.to] {
-                r.step(accept_and_reply(&m)).expect("");
+                r.step(accept_and_reply(&m)).await.expect("");
             }
         }
 
@@ -538,8 +545,8 @@ fn test_leader_acknowledge_commit() {
 // entries created by previous leaders.
 // Also, it applies the entry to its local state machine (in log order).
 // Reference: section 5.3
-#[test]
-fn test_leader_commit_preceding_entries() {
+#[tokio::test]
+async fn test_leader_commit_preceding_entries() {
     let l = default_logger();
     let mut tests = vec![
         vec![],
@@ -550,21 +557,22 @@ fn test_leader_commit_preceding_entries() {
 
     for (i, mut tt) in tests.drain(..).enumerate() {
         let mut r = {
-            let store = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![]));
+            let store = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![])).await;
             store.wl().append(&tt).unwrap();
             let cfg = new_test_config(1, 10, 1);
-            new_test_raft_with_config(&cfg, store, &l)
+            new_test_raft_with_config(&cfg, store, &l).await
         };
-        r.load_state(&hard_state(2, 0, 0));
-        r.become_candidate();
-        r.become_leader();
+        r.load_state(&hard_state(2, 0, 0)).await;
+        r.become_candidate().await;
+        r.become_leader().await;
 
         r.step(new_message(1, 1, MessageType::MsgPropose, 1))
+            .await
             .expect("");
-        r.persist();
+        r.persist().await;
 
         for m in r.read_messages() {
-            r.step(accept_and_reply(&m)).expect("");
+            r.step(accept_and_reply(&m)).await.expect("");
         }
 
         let li = tt.len() as u64;
@@ -572,7 +580,7 @@ fn test_leader_commit_preceding_entries() {
             empty_entry(3, li + 1),
             new_entry(3, li + 2, SOME_DATA),
         ]);
-        let g = r.raft_log.next_entries(None);
+        let g = r.raft_log.next_entries(None).await;
         let wg = Some(tt);
         if g != wg {
             panic!("#{}: ents = {:?}, want {:?}", i, g, wg);
@@ -583,8 +591,8 @@ fn test_leader_commit_preceding_entries() {
 // test_follower_commit_entry tests that once a follower learns that a log entry
 // is committed, it applies the entry to its local state machine (in log order).
 // Reference: section 5.3
-#[test]
-fn test_follower_commit_entry() {
+#[tokio::test]
+async fn test_follower_commit_entry() {
     let l = default_logger();
     let mut tests = vec![
         (vec![new_entry(1, 1, SOME_DATA)], 1),
@@ -612,15 +620,15 @@ fn test_follower_commit_entry() {
     ];
 
     for (i, (ents, commit)) in tests.drain(..).enumerate() {
-        let mut r = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l);
-        r.become_follower(1, 2);
+        let mut r = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
+        r.become_follower(1, 2).await;
 
         let mut m = new_message(2, 1, MessageType::MsgAppend, 0);
         m.term = 1;
         m.commit = commit;
         m.entries = ents.clone();
-        r.step(m).expect("");
-        r.persist();
+        r.step(m).await.expect("");
+        r.persist().await;
 
         if r.raft_log.committed != commit {
             panic!(
@@ -629,7 +637,7 @@ fn test_follower_commit_entry() {
             );
         }
         let wents = Some(ents[..commit as usize].to_vec());
-        let g = r.raft_log.next_entries(None);
+        let g = r.raft_log.next_entries(None).await;
         if g != wents {
             panic!("#{}: next_ents = {:?}, want {:?}", i, g, wents);
         }
@@ -641,8 +649,8 @@ fn test_follower_commit_entry() {
 // then it refuses the new entries. Otherwise it replies that it accepts the
 // append entries.
 // Reference: section 5.3
-#[test]
-fn test_follower_check_msg_append() {
+#[tokio::test]
+async fn test_follower_check_msg_append() {
     let l = default_logger();
     let ents = vec![empty_entry(1, 1), empty_entry(2, 2)];
     let mut tests = vec![
@@ -669,19 +677,19 @@ fn test_follower_check_msg_append() {
         tests.drain(..).enumerate()
     {
         let mut r = {
-            let store = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![]));
+            let store = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![])).await;
             store.wl().append(&ents).unwrap();
             let cfg = new_test_config(1, 10, 1);
-            new_test_raft_with_config(&cfg, store, &l)
+            new_test_raft_with_config(&cfg, store, &l).await
         };
-        r.load_state(&hard_state(0, 1, 0));
-        r.become_follower(2, 2);
+        r.load_state(&hard_state(0, 1, 0)).await;
+        r.become_follower(2, 2).await;
 
         let mut m = new_message(2, 1, MessageType::MsgAppend, 0);
         m.term = 2;
         m.log_term = term;
         m.index = index;
-        r.step(m).expect("");
+        r.step(m).await.expect("");
 
         let msgs = r.read_messages();
         let mut wm = new_message(1, 2, MessageType::MsgAppendResponse, 0);
@@ -705,8 +713,8 @@ fn test_follower_check_msg_append() {
 // and append any new entries not already in the log.
 // Also, it writes the new entry into stable storage.
 // Reference: section 5.3
-#[test]
-fn test_follower_append_entries() {
+#[tokio::test]
+async fn test_follower_append_entries() {
     let l = default_logger();
     let mut tests = vec![
         (
@@ -740,24 +748,24 @@ fn test_follower_append_entries() {
     ];
     for (i, (index, term, ents, wents, wunstable)) in tests.drain(..).enumerate() {
         let mut r = {
-            let store = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![]));
+            let store = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![])).await;
             store
                 .wl()
                 .append(&[empty_entry(1, 1), empty_entry(2, 2)])
                 .unwrap();
             let cfg = new_test_config(1, 10, 1);
-            new_test_raft_with_config(&cfg, store, &l)
+            new_test_raft_with_config(&cfg, store, &l).await
         };
-        r.become_follower(2, 2);
+        r.become_follower(2, 2).await;
 
         let mut m = new_message(2, 1, MessageType::MsgAppend, 0);
         m.term = 2;
         m.log_term = term;
         m.index = index;
         m.entries = ents;
-        r.step(m).expect("");
+        r.step(m).await.expect("");
 
-        let g = r.raft_log.all_entries();
+        let g = r.raft_log.all_entries().await;
         if g != wents {
             panic!("#{}: ents = {:?}, want {:?}", i, g, wents);
         }
@@ -771,8 +779,8 @@ fn test_follower_append_entries() {
 // test_leader_sync_follower_log tests that the leader could bring a follower's log
 // into consistency with its own.
 // Reference: section 5.3, figure 7
-#[test]
-fn test_leader_sync_follower_log() {
+#[tokio::test]
+async fn test_leader_sync_follower_log() {
     let l = default_logger();
     let ents = vec![
         empty_entry(1, 1),
@@ -857,38 +865,39 @@ fn test_leader_sync_follower_log() {
     ];
     for (i, tt) in tests.drain(..).enumerate() {
         let mut lead = {
-            let store = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![]));
+            let store = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![])).await;
             store.wl().append(&ents).unwrap();
             let cfg = new_test_config(1, 10, 1);
-            new_test_raft_with_config(&cfg, store, &l)
+            new_test_raft_with_config(&cfg, store, &l).await
         };
-        let last_index = lead.raft_log.last_index();
-        lead.load_state(&hard_state(term, last_index, 0));
+        let last_index = lead.raft_log.last_index().await;
+        lead.load_state(&hard_state(term, last_index, 0)).await;
 
         let mut follower = {
-            let store = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![]));
+            let store = MemStorage::new_with_conf_state((vec![1, 2, 3], vec![])).await;
             store.wl().append(&tt).unwrap();
             let cfg = new_test_config(2, 10, 1);
-            new_test_raft_with_config(&cfg, store, &l)
+            new_test_raft_with_config(&cfg, store, &l).await
         };
-        follower.load_state(&hard_state(term - 1, 0, 0));
+        follower.load_state(&hard_state(term - 1, 0, 0)).await;
 
         // It is necessary to have a three-node cluster.
         // The second may have more up-to-date log than the first one, so the
         // first node needs the vote from the third node to become the leader.
-        let mut n = Network::new(vec![Some(lead), Some(follower), NOP_STEPPER], &l);
-        n.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
+        let mut n = Network::new(vec![Some(lead), Some(follower), NOP_STEPPER], &l).await;
+        n.send(vec![new_message(1, 1, MessageType::MsgHup, 0)])
+            .await;
         // The election occurs in the term after the one we loaded with
         // lead.load_state above.
         let mut m = new_message(3, 1, MessageType::MsgRequestVoteResponse, 0);
         m.term = term + 1;
-        n.send(vec![m]);
+        n.send(vec![m]).await;
 
         let mut m = new_message(1, 1, MessageType::MsgPropose, 0);
         m.entries = vec![Entry::default()];
-        n.send(vec![m]);
-        let lead_str = ltoa(&n.peers[&1].raft_log);
-        let follower_str = ltoa(&n.peers[&2].raft_log);
+        n.send(vec![m]).await;
+        let lead_str = ltoa(&n.peers[&1].raft_log).await;
+        let follower_str = ltoa(&n.peers[&2].raft_log).await;
         if lead_str != follower_str {
             panic!(
                 "#{}: lead str: {}, follower_str: {}",
@@ -901,25 +910,25 @@ fn test_leader_sync_follower_log() {
 // test_vote_request tests that the vote request includes information about the candidate’s log
 // and are sent to all of the other nodes.
 // Reference: section 5.4.1
-#[test]
-fn test_vote_request() {
+#[tokio::test]
+async fn test_vote_request() {
     let l = default_logger();
     let mut tests = vec![
         (vec![empty_entry(1, 1)], 2),
         (vec![empty_entry(1, 1), empty_entry(2, 2)], 3),
     ];
     for (j, (ents, wterm)) in tests.drain(..).enumerate() {
-        let mut r = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l);
+        let mut r = new_test_raft(1, vec![1, 2, 3], 10, 1, new_storage(), &l).await;
         let mut m = new_message(2, 1, MessageType::MsgAppend, 0);
         m.term = wterm - 1;
         m.log_term = 0;
         m.index = 0;
         m.entries = ents.clone();
-        r.step(m).expect("");
+        r.step(m).await.expect("");
         r.read_messages();
 
         for _ in 1..r.election_timeout() * 2 {
-            r.tick_election();
+            r.tick_election().await;
         }
 
         let mut msgs = r.read_messages();
@@ -958,8 +967,8 @@ fn test_vote_request() {
 // test_voter tests the voter denies its vote if its own log is more up-to-date
 // than that of the candidate.
 // Reference: section 5.4.1
-#[test]
-fn test_voter() {
+#[tokio::test]
+async fn test_voter() {
     let l = default_logger();
     let mut tests = vec![
         // same logterm
@@ -976,16 +985,16 @@ fn test_voter() {
         (vec![empty_entry(2, 1), empty_entry(1, 2)], 1, 1, true),
     ];
     for (i, (ents, log_term, index, wreject)) in tests.drain(..).enumerate() {
-        let s = MemStorage::new_with_conf_state((vec![1, 2], vec![]));
+        let s = MemStorage::new_with_conf_state((vec![1, 2], vec![])).await;
         s.wl().append(&ents).unwrap();
         let cfg = new_test_config(1, 10, 1);
-        let mut r = new_test_raft_with_config(&cfg, s, &l);
+        let mut r = new_test_raft_with_config(&cfg, s, &l).await;
 
         let mut m = new_message(2, 1, MessageType::MsgRequestVote, 0);
         m.term = 3;
         m.log_term = log_term;
         m.index = index;
-        r.step(m).expect("");
+        r.step(m).await.expect("");
 
         let msgs = r.read_messages();
         if msgs.len() != 1 {
@@ -1008,8 +1017,8 @@ fn test_voter() {
 // TestLeaderOnlyCommitsLogFromCurrentTerm tests that only log entries from the leader’s
 // current term are committed by counting replicas.
 // Reference: section 5.4.2
-#[test]
-fn test_leader_only_commits_log_from_current_term() {
+#[tokio::test]
+async fn test_leader_only_commits_log_from_current_term() {
     let l = default_logger();
     let ents = vec![empty_entry(1, 1), empty_entry(2, 2)];
     let mut tests = vec![
@@ -1021,27 +1030,28 @@ fn test_leader_only_commits_log_from_current_term() {
     ];
     for (i, (index, wcommit)) in tests.drain(..).enumerate() {
         let mut r = {
-            let store = MemStorage::new_with_conf_state((vec![1, 2], vec![]));
+            let store = MemStorage::new_with_conf_state((vec![1, 2], vec![])).await;
             store.wl().append(&ents).unwrap();
             let cfg = new_test_config(1, 10, 1);
-            new_test_raft_with_config(&cfg, store, &l)
+            new_test_raft_with_config(&cfg, store, &l).await
         };
-        r.load_state(&hard_state(2, 0, 0));
+        r.load_state(&hard_state(2, 0, 0)).await;
 
         // become leader at term 3
-        r.become_candidate();
-        r.become_leader();
+        r.become_candidate().await;
+        r.become_leader().await;
         r.read_messages();
 
         // propose a entry to current term
         r.step(new_message(1, 1, MessageType::MsgPropose, 1))
+            .await
             .expect("");
-        r.persist();
+        r.persist().await;
 
         let mut m = new_message(2, 1, MessageType::MsgAppendResponse, 0);
         m.term = r.term;
         m.index = index;
-        r.step(m).expect("");
+        r.step(m).await.expect("");
         if r.raft_log.committed != wcommit {
             panic!(
                 "#{}: commit = {}, want {}",
