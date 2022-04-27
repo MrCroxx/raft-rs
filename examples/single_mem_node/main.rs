@@ -95,7 +95,7 @@ async fn main() {
         if d >= timeout {
             timeout = Duration::from_millis(100);
             // We drive Raft every 100ms.
-            r.tick();
+            r.tick().await;
         } else {
             timeout -= d;
         }

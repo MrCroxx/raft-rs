@@ -62,10 +62,11 @@ slog-term = "2.4.0"
 name = "benches"
 harness = false
 
-# [[example]]
-# name = "single_mem_node"
-# path = "examples/single_mem_node/main.rs"
+[[example]]
+name = "single_mem_node"
+path = "examples/single_mem_node/main.rs"
 
+# Temporarily disabled.
 # [[example]]
 # name = "five_mem_node"
 # path = "examples/five_mem_node/main.rs"
