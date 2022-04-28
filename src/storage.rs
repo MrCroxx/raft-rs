@@ -30,10 +30,11 @@ use crate::util::limit_size;
 
 use async_trait::async_trait;
 use getset::{Getters, Setters};
+use serde_derive::{Deserialize, Serialize};
 
 /// Holds both the hard state (commit index, vote leader, term) and the configuration state
 /// (Current node IDs)
-#[derive(Debug, Clone, Default, Getters, Setters)]
+#[derive(Debug, Clone, Default, Getters, Setters, Serialize, Deserialize)]
 pub struct RaftState {
     /// Contains the last meta information including commit index, the vote leader, and the vote term.
     pub hard_state: HardState,
