@@ -184,11 +184,12 @@ impl<T: Storage> RaftLog<T> {
         for e in ents {
             if !self.match_term(e.index, e.term).await {
                 if e.index <= self.last_index().await {
+                    let existing_term = self.term(e.index).await.unwrap_or(0);
                     info!(
                         self.unstable.logger,
                         "found conflict at index {index}",
                         index = e.index;
-                        "existing term" => self.term(e.index).await.unwrap_or(0),
+                        "existing term" => existing_term,
                         "conflicting term" => e.term,
                     );
                 }
@@ -289,12 +290,13 @@ impl<T: Storage> RaftLog<T> {
         if self.committed >= to_commit {
             return;
         }
-        if self.last_index().await < to_commit {
+        let last_index = self.last_index().await;
+        if last_index < to_commit {
             fatal!(
                 self.unstable.logger,
                 "to_commit {} is out of range [last_index {}]",
                 to_commit,
-                self.last_index().await
+                last_index,
             )
         }
         self.committed = to_commit;
@@ -492,8 +494,9 @@ impl<T: Storage> RaftLog<T> {
         if low < first_index {
             return Some(Error::Store(StorageError::Compacted));
         }
+        let last_index = self.last_index().await;
 
-        let length = self.last_index().await + 1 - first_index;
+        let length = last_index + 1 - first_index;
         if low < first_index || high > first_index + length {
             fatal!(
                 self.unstable.logger,
@@ -501,7 +504,7 @@ impl<T: Storage> RaftLog<T> {
                 low,
                 high,
                 first_index,
-                self.last_index().await
+                last_index
             )
         }
         None

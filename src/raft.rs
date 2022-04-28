@@ -382,14 +382,16 @@ impl<T: Storage> Raft<T> {
         }
         r.become_follower(r.term, INVALID_ID).await;
 
+        let last_index = r.raft_log.last_index().await;
+        let last_term = r.raft_log.last_term().await;
         info!(
             r.logger,
             "newRaft";
             "term" => r.term,
             "commit" => r.raft_log.committed,
             "applied" => r.raft_log.applied,
-            "last index" => r.raft_log.last_index().await,
-            "last term" => r.raft_log.last_term().await,
+            "last index" => last_index,
+            "last term" => last_term,
             "peers" => ?r.prs.conf().voters,
         );
         Ok(r)
@@ -1350,12 +1352,14 @@ impl<T: Storage> Raft<T> {
                     // This is included in the 3rd concern for Joint Consensus, where if another
                     // peer is removed from the cluster it may try to hold elections and disrupt
                     // stability.
+                    let log_term = self.raft_log.last_term().await;
+                    let log_index = self.raft_log.last_index().await;
                     info!(
                         self.logger,
                         "[logterm: {log_term}, index: {log_index}, vote: {vote}] ignored vote from \
                          {from} [logterm: {msg_term}, index: {msg_index}]: lease is not expired",
-                        log_term = self.raft_log.last_term().await,
-                        log_index = self.raft_log.last_index().await,
+                        log_term = log_term,
+                        log_index = log_index,
                         vote = self.vote,
                         from = m.from,
                         msg_term = m.log_term,
@@ -1431,12 +1435,14 @@ impl<T: Storage> Raft<T> {
                 // Before pre_vote enable, there may be a receiving candidate with higher term,
                 // but less log. After update to pre_vote, the cluster may deadlock if
                 // we drop messages with a lower term.
+                let log_term = self.raft_log.last_term().await;
+                let log_index = self.raft_log.last_index().await;
                 info!(
                     self.logger,
                     "{} [log_term: {}, index: {}, vote: {}] rejected {:?} from {} [log_term: {}, index: {}] at term {}",
                     self.id,
-                    self.raft_log.last_term().await,
-                    self.raft_log.last_index().await,
+                    log_term,
+                    log_index,
                     self.vote,
                     m.msg_type(),
                     m.from,
@@ -1582,12 +1588,14 @@ impl<T: Storage> Raft<T> {
     }
 
     async fn log_vote_approve(&self, m: &Message) {
+        let log_term = self.raft_log.last_term().await;
+        let log_index = self.raft_log.last_index().await;
         info!(
             self.logger,
             "[logterm: {log_term}, index: {log_index}, vote: {vote}] cast vote for {from} [logterm: {msg_term}, index: {msg_index}] \
              at term {term}",
-            log_term = self.raft_log.last_term().await,
-            log_index = self.raft_log.last_index().await,
+            log_term = log_term,
+            log_index = log_index,
             vote = self.vote,
             from = m.from,
             msg_term = m.log_term,
@@ -1598,12 +1606,14 @@ impl<T: Storage> Raft<T> {
     }
 
     async fn log_vote_reject(&self, m: &Message) {
+        let log_term = self.raft_log.last_term().await;
+        let log_index = self.raft_log.last_index().await;
         info!(
             self.logger,
             "[logterm: {log_term}, index: {log_index}, vote: {vote}] rejected vote from {from} [logterm: {msg_term}, index: \
              {msg_index}] at term {term}",
-            log_term = self.raft_log.last_term().await,
-            log_index = self.raft_log.last_index().await,
+            log_term = log_term,
+            log_index = log_index,
             vote = self.vote,
             from = m.from,
             msg_term = m.log_term,
@@ -2200,8 +2210,10 @@ impl<T: Storage> Raft<T> {
         }
 
         let log = &mut self.r.raft_log;
+        let last_term = log.last_term().await;
+        let last_index = log.last_index().await;
         info!(self.r.logger, "[commit: {}, lastindex: {}, lastterm: {}] fast-forwarded commit to vote request [index: {}, term: {}]",
-                log.committed, log.last_index().await, log.last_term().await, m.commit, m.commit_term);
+                log.committed, last_index, last_term, m.commit, m.commit_term);
 
         if self.state != StateRole::Candidate && self.state != StateRole::PreCandidate {
             return;
@@ -2486,6 +2498,7 @@ impl<T: Storage> Raft<T> {
         {
             to_send.index = last_idx;
         } else {
+            let log_term = self.raft_log.term(m.index).await;
             debug!(
                 self.logger,
                 "rejected msgApp [logterm: {msg_log_term}, index: {msg_index}] \
@@ -2494,7 +2507,7 @@ impl<T: Storage> Raft<T> {
                 msg_index = m.index,
                 from = m.from;
                 "index" => m.index,
-                "logterm" => ?self.raft_log.term(m.index).await,
+                "logterm" => ?log_term,
             );
 
             let hint_index = cmp::min(m.index, self.raft_log.last_index().await);
@@ -2612,12 +2625,14 @@ impl<T: Storage> Raft<T> {
         if self.pending_request_snapshot == INVALID_INDEX
             && self.raft_log.match_term(meta.index, meta.term).await
         {
+            let last_term = self.raft_log.last_term().await;
+            let last_index = self.raft_log.last_index().await;
             info!(
                 self.logger,
                 "fast-forwarded commit to snapshot";
                 "commit" => self.raft_log.committed,
-                "last_index" => self.raft_log.last_index().await,
-                "last_term" => self.raft_log.last_term().await,
+                "last_index" => last_index,
+                "last_term" => last_term,
                 "snapshot_index" => snap_index,
                 "snapshot_term" => snap_term
             );
@@ -2667,12 +2682,14 @@ impl<T: Storage> Raft<T> {
 
         self.pending_request_snapshot = INVALID_INDEX;
 
+        let last_term = self.raft_log.last_term().await;
+        let last_index = self.raft_log.last_index().await;
         info!(
             self.logger,
             "restored snapshot";
             "commit" => self.raft_log.committed,
-            "last_index" => self.raft_log.last_index().await,
-            "last_term" => self.raft_log.last_term().await,
+            "last_index" => last_index,
+            "last_term" => last_term,
             "snapshot_index" => snap_index,
             "snapshot_term" => snap_term,
         );
@@ -2798,12 +2815,13 @@ impl<T: Storage> Raft<T> {
     /// For a given hardstate, load the state into self.
     pub async fn load_state(&mut self, hs: &HardState) {
         if hs.commit < self.raft_log.committed || hs.commit > self.raft_log.last_index().await {
+            let last_index = self.raft_log.last_index().await;
             fatal!(
                 self.logger,
                 "hs.commit {} is out of range [{}, {}]",
                 hs.commit,
                 self.raft_log.committed,
-                self.raft_log.last_index().await
+                last_index,
             )
         }
         self.raft_log.committed = hs.commit;
